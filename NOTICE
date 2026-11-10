@@ -1,0 +1,17 @@
+ShardFly
+Copyright 2026 ShardFly contributors
+
+This product includes software derived from the Awex project
+(https://github.com/inclusionAI/Awex), Copyright the Awex developers,
+licensed under the Apache License, Version 2.0. The derived portions are the
+Python utility, planning, metadata and weight-conversion, and framework
+integration layers; each derived file carries an Awex attribution notice in
+its header.
+
+This product includes a GIN all-gather rail-ring kernel pattern adapted from
+NCCL (Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES), licensed under
+the Apache License, Version 2.0. The adaptation is marked in
+include/shardfly/kernel.cuh.
+
+This product integrates with vLLM and veRL. Those projects are not vendored
+here; their own licenses apply when they are installed.

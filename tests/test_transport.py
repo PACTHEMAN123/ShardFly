@@ -1,0 +1,642 @@
+# Copyright 2026 ShardFly contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+import os
+import threading
+from types import SimpleNamespace
+
+import pytest
+import torch
+from shardfly import transport
+from shardfly.plan import CommunicationOperation, TransferPlan
+from shardfly.topology import (
+    _active_rdma_endpoints,
+    _configure_gin_hca_policy,
+    _parse_nvidia_topology,
+    _RdmaEndpoint,
+    _weighted_hca_assignments,
+)
+from shardfly.transport import (
+    _build_recv_batch,
+    _build_send_batch,
+    _node_major_communicator_ranks,
+)
+
+
+def _replica_operation(root: int, receiver: int) -> CommunicationOperation:
+    shard = SimpleNamespace(name="weight", shape=(8,))
+    return CommunicationOperation(
+        send_rank=root,
+        send_shard_meta=shard,
+        send_offset=(0,),
+        recv_rank=receiver,
+        recv_shard_meta=shard,
+        recv_offset=(0,),
+        overlap_shape=(8,),
+        train_slices=(slice(None),),
+        inf_slices=(slice(None),),
+    )
+
+
+def test_dp_entry_pairs_replicas_when_each_spans_multiple_nodes(monkeypatch):
+    monkeypatch.setenv("SHARDFLY_RING_DP_ENTRY", "1")
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    # DP0 spans training nodes A/B, DP1 spans C/D; global rank order is
+    # deliberately interleaved. Physical node order cannot identify DP.
+    for root, dp in [(16, 0), (24, 0), (20, 1), (28, 1)]:
+        operations = [_replica_operation(root, peer) for peer in (0, 4, 8, 12)]
+        for op in operations:
+            op.send_shard_meta.dp_rank = dp
+        options = dict(infer_instance_world_size=4, num_infer_engines=4,
+                       ring_broadcast=True, ring_swizzle=True,
+                       rollout_node_ids=("rollout0", "rollout1", "rollout0", "rollout1"))
+        send = _build_send_batch({"weight":torch.arange(8).float()},
+                                 TransferPlan(operations={o.recv_rank:[o] for o in operations}),
+                                 root, 32, 0, **options)
+        assert len(send.peers) == 1
+        assert (send.peers[0] // 4) % 2 == dp
+        for op in operations:
+            recv = _build_recv_batch({"weight":torch.empty(8)},
+                                     TransferPlan(operations={root:[op]}),
+                                     op.recv_rank, 32, 0, **options)
+            assert (recv.peers[0] == root) == (op.recv_rank == send.peers[0])
+            if recv.forward_peers[0] >= 0:
+                next_op = next(o for o in operations if o.recv_rank == recv.forward_peers[0])
+                next_batch = _build_recv_batch({"weight":torch.empty(8)},
+                                              TransferPlan(operations={root:[next_op]}),
+                                              next_op.recv_rank, 32, 0, **options)
+                assert next_batch.peers == [op.recv_rank]
+
+
+def test_node_major_communicator_ranks_join_split_physical_nodes():
+    node_ids = [10] * 4 + [20] * 4 + [10] * 4 + [20] * 4 + [30] * 8 + [40] * 8
+
+    mapping = _node_major_communicator_ranks(node_ids)
+
+    assert [mapping[rank] for rank in range(0, 4)] == [0, 1, 2, 3]
+    assert [mapping[rank] for rank in range(8, 12)] == [4, 5, 6, 7]
+    assert [mapping[rank] for rank in range(4, 8)] == [8, 9, 10, 11]
+    assert [mapping[rank] for rank in range(12, 16)] == [12, 13, 14, 15]
+    assert sorted(mapping) == list(range(32))
+
+
+@pytest.mark.parametrize("engines", range(1, 7))
+def test_colocated_tp_replicas_share_lsa_team_with_uneven_node_sizes(engines):
+    node_ids = [
+        10 + engine % 3 for engine in range(engines) for _ in range(4)
+    ] + [40] * 8
+    mapping = _node_major_communicator_ranks(
+        node_ids, inference_tp_size=4, num_infer_engines=engines
+    )
+    populations = [node_ids.count(node) for node in set(node_ids)]
+    lsa_size = math.gcd(*populations)
+
+    assert sorted(mapping) == list(range(engines * 4 + 8))
+    for node in set(node_ids):
+        ranks = sorted(mapping[rank] for rank, n in enumerate(node_ids) if n == node)
+        assert ranks == list(range(ranks[0], ranks[0] + len(ranks)))
+    for engine in range(3, engines):
+        for tp_rank in range(4):
+            first = mapping[(engine - 3) * 4 + tp_rank]
+            second = mapping[engine * 4 + tp_rank]
+            assert first // lsa_size == second // lsa_size
+    assert mapping[engines * 4 :] == list(range(engines * 4, engines * 4 + 8))
+    if engines in (1, 2, 3, 6):
+        assert mapping == _node_major_communicator_ranks(node_ids)
+
+
+def test_incomplete_tp_instances_keep_original_communicator_order():
+    node_ids = [10, 10, 20, 20, 10, 10, 20, 20] + [30] * 8
+    assert _node_major_communicator_ranks(
+        node_ids, inference_tp_size=4, num_infer_engines=2
+    ) == _node_major_communicator_ranks(node_ids)
+
+
+def test_interleaved_bias_vectors_bind_original_storage_without_copyback(monkeypatch):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    backing = torch.full((16,), -1.0)
+    parameters = {"gate": backing[::2], "up": backing[1::2]}
+    operations = []
+    for name in parameters:
+        operation = _replica_operation(4, 1)
+        operation.recv_shard_meta.name = name
+        operations.append(operation)
+    plan = TransferPlan(operations={4: operations})
+    batch = _build_recv_batch(parameters, plan, 1, 5, 0, allow_staging=False)
+    assert batch.copybacks == []
+    assert batch.tensor_row_bytes == [4, 4]
+    assert batch.tensor_row_strides == [8, 8]
+    for index, destination in enumerate(batch.tensors):
+        assert destination.data_ptr() == parameters[("gate", "up")[index]].data_ptr()
+        destination.copy_(torch.arange(8) + 100 * (index + 1))
+    assert torch.equal(backing[::2], torch.arange(8) + 100)
+    assert torch.equal(backing[1::2], torch.arange(8) + 200)
+
+
+def test_prepared_send_observes_inplace_updates_without_new_storage(monkeypatch):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    comm = transport.Transport(object(), 4, 5, chunk_bytes=0, ring_broadcast=False)
+    plan = TransferPlan(operations={1: [_replica_operation(4, 1)]})
+    source = torch.arange(8).float()
+    parameters = {"weight": source}
+    comm.prepare_send(parameters, plan, allow_staging=False)
+    observed = []
+
+    def launch(batch, **kwargs):
+        observed.append(
+            (id(batch), batch.tensors[0].data_ptr(), batch.tensors[0].clone())
+        )
+        assert batch.copybacks == []
+        return {}
+
+    monkeypatch.setattr(comm, "_run", launch)
+    comm.send(parameters, plan, -1)
+    source.add_(20)
+    comm.send(parameters, plan, 0)
+    assert observed[0][:2] == observed[1][:2]
+    assert observed[0][1] == source.data_ptr()
+    assert torch.equal(observed[1][2], torch.arange(8).float() + 20)
+
+
+def test_v2_ring_broadcast_is_disabled_by_default(monkeypatch):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+    plan = TransferPlan(
+        operations={peer: [_replica_operation(4, peer)] for peer in range(4)}
+    )
+
+    batch = _build_send_batch(
+        {"weight": tensor},
+        plan,
+        rank=4,
+        world_size=5,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+    )
+
+    assert batch.peers == [0, 1, 2, 3]
+    assert batch.ring_ids == [-1, -1, -1, -1]
+
+
+def test_v2_fixed_ring_injects_one_copy_and_relays_in_engine_order(monkeypatch):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+    send_plan = TransferPlan(
+        operations={peer: [_replica_operation(4, peer)] for peer in range(4)}
+    )
+    send_batch = _build_send_batch(
+        {"weight": tensor},
+        send_plan,
+        rank=4,
+        world_size=5,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+        ring_broadcast=True,
+    )
+
+    assert send_batch.peers == [0]
+    assert send_batch.expected_counts == [1, 0, 0, 0, 0]
+    assert send_batch.ring_ids == [4]
+
+    recv_batch = _build_recv_batch(
+        {"weight": torch.empty_like(tensor)},
+        TransferPlan(operations={4: [_replica_operation(4, 1)]}),
+        rank=1,
+        world_size=5,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+        ring_broadcast=True,
+    )
+    assert recv_batch.peers == [0]
+    assert recv_batch.forward_peers == [2]
+    assert recv_batch.ring_ids == [4]
+
+
+def test_v2_swizzle_rotates_ring_by_root(monkeypatch):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+    send_plan = TransferPlan(
+        operations={peer: [_replica_operation(5, peer)] for peer in range(4)}
+    )
+    send_batch = _build_send_batch(
+        {"weight": tensor},
+        send_plan,
+        rank=5,
+        world_size=6,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+        ring_broadcast=True,
+        ring_swizzle=True,
+    )
+
+    assert send_batch.peers == [1]
+    assert send_batch.ring_ids == [5]
+
+    last_batch = _build_recv_batch(
+        {"weight": torch.empty_like(tensor)},
+        TransferPlan(operations={5: [_replica_operation(5, 0)]}),
+        rank=0,
+        world_size=6,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+        ring_broadcast=True,
+        ring_swizzle=True,
+    )
+    assert last_batch.peers == [3]
+    assert last_batch.forward_peers == [-1]
+
+
+@pytest.mark.parametrize("root", [8, 9, 10, 11])
+def test_naive_ring_has_fixed_entry_and_groups_actual_nodes(monkeypatch, root):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+    topology = (20, 10, 20, 10)
+    targets = [0, 2, 4, 6]
+    common = dict(
+        world_size=24,
+        chunk_bytes=16,
+        infer_instance_world_size=2,
+        num_infer_engines=4,
+        ring_broadcast=True,
+        rollout_node_ids=topology,
+    )
+    send = _build_send_batch(
+        {"weight": tensor},
+        TransferPlan(operations={p: [_replica_operation(root, p)] for p in targets}),
+        rank=root,
+        **common,
+    )
+    assert send.peers == [0]
+    # Engine IDs alternate nodes; the actual chain groups them as 0,2,1,3.
+    for rank, source, forward in ((0, root, 4), (4, 0, 2), (2, 4, 6), (6, 2, -1)):
+        recv = _build_recv_batch(
+            {"weight": torch.empty_like(tensor)},
+            TransferPlan(operations={root: [_replica_operation(root, rank)]}),
+            rank=rank,
+            **common,
+        )
+        assert recv.peers == [source]
+        assert recv.forward_peers == [forward]
+        assert recv.ring_ids == send.ring_ids
+
+
+def test_resolve_rollout_topology_uses_group_placement_once(monkeypatch):
+    instance = transport.Transport.__new__(transport.Transport)
+    instance._operation_lock = threading.RLock()
+    instance.ring_broadcast = True
+    instance.ring_source_node_swizzle = False
+    instance.rollout_node_ids = None
+    instance.world_size = 24
+    instance.infer_instance_world_size = 2
+    instance.num_infer_engines = 4
+    instance.group = object()
+    calls = []
+
+    def gather(result, node, *, group):
+        assert group is instance.group
+        calls.append(node)
+        result[:] = [20, 20, 10, 10, 20, 20, 10, 10] + [30] * 16
+
+    monkeypatch.setattr(transport.dist, "all_gather_object", gather)
+    instance.resolve_rollout_topology()
+    instance.resolve_rollout_topology()
+    assert instance.rollout_node_ids == (20, 10, 20, 10)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("tp,topology", [(8, (10, 20)), (4, (10, 10, 20, 20))])
+def test_source_nodes_spread_ring_entries_and_match_every_relay(monkeypatch, tp, topology):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    nodes = [10] * 8 + [20] * 8 + [30] * 8 + [40] * 8
+    seeds = transport._source_node_ring_seeds(nodes, 16, 2)
+    tensor = torch.arange(8, dtype=torch.int32)
+    targets = list(range(0, 16, tp))
+    common = dict(world_size=32, chunk_bytes=16, infer_instance_world_size=tp,
+                  num_infer_engines=len(topology), ring_broadcast=True,
+                  ring_swizzle=True, rollout_node_ids=topology, ring_root_seeds=seeds)
+    for root in range(16, 32):
+        ordered = transport._ring_order(
+            root, targets, transport._RingOrderStrategy.ROOT_SWIZZLE,
+            infer_instance_world_size=tp, num_infer_engines=len(topology),
+            rollout_node_ids=topology, ring_root_seeds=seeds,
+        )
+        assert topology[ordered[0] // tp] == (10 if root < 24 else 20)
+        send = _build_send_batch(
+            {"weight": tensor},
+            TransferPlan(operations={p: [_replica_operation(root, p)] for p in targets}),
+            rank=root, **common,
+        )
+        assert send.peers == ordered[:1]
+        for index, rank in enumerate(ordered):
+            recv = _build_recv_batch(
+                {"weight": torch.empty_like(tensor)},
+                TransferPlan(operations={root: [_replica_operation(root, rank)]}),
+                rank=rank, **common,
+            )
+            assert recv.peers == [root if index == 0 else ordered[index - 1]]
+            assert recv.forward_peers == [ordered[index + 1] if index + 1 < len(ordered) else -1]
+            assert recv.ring_ids == send.ring_ids
+
+
+def test_source_node_seeds_use_actual_uneven_placement():
+    seeds = transport._source_node_ring_seeds([10, 20, 40, 30, 40, 40, 30], 2, 2)
+    assert seeds[2:] == (0, 1, 2, 4, 3)
+
+
+def test_source_node_topology_collects_once_with_explicit_rollout_nodes(monkeypatch):
+    instance = transport.Transport.__new__(transport.Transport)
+    instance._operation_lock = threading.RLock()
+    instance.ring_broadcast = True
+    instance.ring_source_node_swizzle = True
+    instance.ring_root_seeds = None
+    instance.rollout_node_ids = (10, 20)
+    instance.world_size = 7
+    instance.infer_instance_world_size = 1
+    instance.num_infer_engines = 2
+    instance.group = object()
+    calls = []
+
+    def gather(result, node, *, group):
+        calls.append(node)
+        result[:] = [10, 20, 40, 30, 40, 40, 30]
+
+    monkeypatch.setattr(transport.dist, "all_gather_object", gather)
+    instance.resolve_rollout_topology()
+    instance.resolve_rollout_topology()
+    assert instance.ring_root_seeds[2:] == (0, 1, 2, 4, 3)
+    assert len(calls) == 1
+
+
+def test_v2_swizzle_groups_round_robin_engines_by_node(monkeypatch):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    monkeypatch.setenv("SHARDFLY_NODE_LOCAL_WORLD_SIZE", "8")
+    tensor = torch.arange(8, dtype=torch.int32)
+    targets = list(range(0, 16, 2))
+    send_plan = TransferPlan(
+        operations={peer: [_replica_operation(16, peer)] for peer in targets}
+    )
+
+    send_batch = _build_send_batch(
+        {"weight": tensor},
+        send_plan,
+        rank=16,
+        world_size=32,
+        chunk_bytes=16,
+        infer_instance_world_size=2,
+        num_infer_engines=8,
+        ring_broadcast=True,
+        ring_swizzle=True,
+    )
+    assert send_batch.peers == [0]
+
+    local_relay = _build_recv_batch(
+        {"weight": torch.empty_like(tensor)},
+        TransferPlan(operations={16: [_replica_operation(16, 0)]}),
+        rank=0,
+        world_size=32,
+        chunk_bytes=16,
+        infer_instance_world_size=2,
+        num_infer_engines=8,
+        ring_broadcast=True,
+        ring_swizzle=True,
+    )
+    assert local_relay.peers == [16]
+    assert local_relay.forward_peers == [4]
+
+    cross_node_relay = _build_recv_batch(
+        {"weight": torch.empty_like(tensor)},
+        TransferPlan(operations={16: [_replica_operation(16, 12)]}),
+        rank=12,
+        world_size=32,
+        chunk_bytes=16,
+        infer_instance_world_size=2,
+        num_infer_engines=8,
+        ring_broadcast=True,
+        ring_swizzle=True,
+    )
+    assert cross_node_relay.peers == [8]
+    assert cross_node_relay.forward_peers == [2]
+
+
+def test_v2_elastic_swizzle_uses_actual_nodes_instead_of_gpu_capacity(monkeypatch):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    monkeypatch.setenv("SHARDFLY_NODE_LOCAL_WORLD_SIZE", "8")
+    tensor = torch.arange(8, dtype=torch.int32)
+    topology = (10, 20, 10, 20)
+    targets = [0, 2, 4, 6]
+    send = _build_send_batch(
+        {"weight": tensor},
+        TransferPlan(
+            operations={peer: [_replica_operation(8, peer)] for peer in targets}
+        ),
+        rank=8,
+        world_size=24,
+        chunk_bytes=16,
+        infer_instance_world_size=2,
+        num_infer_engines=4,
+        ring_broadcast=True,
+        ring_swizzle=True,
+        rollout_node_ids=topology,
+    )
+    assert send.peers == [0]
+    # Both local edges must remain LSA candidates for an intermediate cohort.
+    for rank, source, forward in ((0, 8, 4), (4, 0, 2), (2, 4, 6), (6, 2, -1)):
+        recv = _build_recv_batch(
+            {"weight": torch.empty_like(tensor)},
+            TransferPlan(operations={8: [_replica_operation(8, rank)]}),
+            rank=rank,
+            world_size=24,
+            chunk_bytes=16,
+            infer_instance_world_size=2,
+            num_infer_engines=4,
+            ring_broadcast=True,
+            ring_swizzle=True,
+            rollout_node_ids=topology,
+        )
+        assert recv.peers == [source]
+        assert recv.forward_peers == [forward]
+
+
+def test_v2_swizzle_switch_is_inert_when_ring_broadcast_is_off(monkeypatch):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+    batch = _build_send_batch(
+        {"weight": tensor},
+        TransferPlan(
+            operations={peer: [_replica_operation(5, peer)] for peer in range(4)}
+        ),
+        rank=5,
+        world_size=6,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+        ring_broadcast=False,
+        ring_swizzle=True,
+    )
+
+    assert batch.peers == [0, 1, 2, 3]
+    assert batch.ring_ids == [-1, -1, -1, -1]
+
+
+def test_v2_ring_rejects_partial_replica_streams(monkeypatch):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+
+    with pytest.raises(
+        transport.TransportUnavailableError,
+        match="present in all engines",
+    ):
+        _build_send_batch(
+            {"weight": tensor},
+            TransferPlan(
+                operations={peer: [_replica_operation(5, peer)] for peer in (0, 1)}
+            ),
+            rank=5,
+            world_size=6,
+            chunk_bytes=16,
+            infer_instance_world_size=1,
+            num_infer_engines=4,
+            ring_broadcast=True,
+        )
+
+
+def test_active_rdma_endpoints_read_active_port_capacity(tmp_path):
+    device = tmp_path / "mlx5_7"
+    (device / "device" / "net" / "eth7").mkdir(parents=True)
+    port = device / "ports" / "2"
+    port.mkdir(parents=True)
+    (port / "state").write_text("4: ACTIVE\n", encoding="ascii")
+    (port / "rate").write_text("400 Gb/sec (4X NDR)\n", encoding="ascii")
+
+    endpoints = _active_rdma_endpoints(str(tmp_path))
+
+    assert [(item.name, item.port, item.bandwidth_gbps) for item in endpoints] == [
+        ("mlx5_7", 2, 400.0)
+    ]
+
+
+def test_balanced_hca_policy_groups_ranks_across_devices(monkeypatch):
+    monkeypatch.setenv("SHARDFLY_HCA_POLICY", "balanced")
+    monkeypatch.setenv("LOCAL_RANK", "5")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    monkeypatch.delenv("NCCL_IB_HCA", raising=False)
+    monkeypatch.setattr(
+        "shardfly.topology._active_rdma_endpoints",
+        lambda: [
+            _RdmaEndpoint(name, 1, 200.0, f"/pci/{index}")
+            for index, name in enumerate(["mlx5_3", "mlx5_8", "mlx5_19", "mlx5_30"])
+        ],
+    )
+
+    _configure_gin_hca_policy()
+
+    assert os.environ["NCCL_IB_HCA"] == "=mlx5_19:1"
+
+
+def test_balanced_hca_policy_applies_node_rank_offset(monkeypatch):
+    monkeypatch.setenv("SHARDFLY_HCA_POLICY", "balanced")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
+    monkeypatch.setenv("SHARDFLY_NODE_LOCAL_RANK_OFFSET", "4")
+    monkeypatch.setenv("SHARDFLY_NODE_LOCAL_WORLD_SIZE", "8")
+    monkeypatch.delenv("NCCL_IB_HCA", raising=False)
+    monkeypatch.setattr(
+        "shardfly.topology._active_rdma_endpoints",
+        lambda: [
+            _RdmaEndpoint(name, 1, 200.0, f"/pci/{index}")
+            for index, name in enumerate(["mlx5_3", "mlx5_8", "mlx5_19", "mlx5_30"])
+        ],
+    )
+
+    _configure_gin_hca_policy()
+
+    assert os.environ["NCCL_IB_HCA"] == "=mlx5_19:1"
+
+
+def test_weighted_hca_assignments_follow_capacity_and_payload():
+    endpoints = [
+        _RdmaEndpoint("fast", 1, 400.0, "/pci/0"),
+        _RdmaEndpoint("slow", 1, 200.0, "/pci/1"),
+    ]
+
+    uniform = _weighted_hca_assignments(endpoints, [1] * 6)
+    skewed = _weighted_hca_assignments(endpoints, [800, 700, 100])
+
+    assert [endpoint.name for endpoint in uniform].count("fast") == 4
+    assert [endpoint.name for endpoint in uniform].count("slow") == 2
+    assert [endpoint.name for endpoint in skewed] == ["fast", "slow", "fast"]
+
+
+def test_weighted_hca_assignments_keep_ranks_on_local_numa_rails():
+    endpoints = [
+        _RdmaEndpoint(f"mlx5_{index}", 1, 200.0, f"/pci/{index}") for index in range(4)
+    ]
+    topology = [
+        [3, 3, 4, 4],
+        [0, 3, 4, 4],
+        [3, 3, 4, 4],
+        [3, 0, 4, 4],
+        [4, 4, 0, 3],
+        [4, 4, 3, 3],
+        [4, 4, 3, 0],
+        [4, 4, 3, 3],
+    ]
+
+    assignments = _weighted_hca_assignments(endpoints, [1] * 8, topology)
+
+    assert [endpoint.name for endpoint in assignments] == [
+        "mlx5_0",
+        "mlx5_0",
+        "mlx5_1",
+        "mlx5_1",
+        "mlx5_2",
+        "mlx5_2",
+        "mlx5_3",
+        "mlx5_3",
+    ]
+
+
+def test_parse_nvidia_topology_maps_active_hca_columns():
+    output = """\
+        \x1b[4mGPU0 GPU1 NIC0 NIC1 CPU Affinity\x1b[0m
+GPU0    X    NV18 PIX  SYS  0-7
+GPU1    NV18 X    NODE PIX  0-7
+
+NIC Legend:
+  NIC0: mlx5_3
+  NIC1: mlx5_8
+"""
+    endpoints = [
+        _RdmaEndpoint("mlx5_3", 1, 200.0, "/pci/0"),
+        _RdmaEndpoint("mlx5_8", 1, 200.0, "/pci/1"),
+    ]
+
+    distances = _parse_nvidia_topology(output, endpoints, ["0", "1"])
+
+    assert distances == [[0, 4], [3, 0]]
+
+
+def test_balanced_hca_policy_preserves_explicit_nccl_selection(monkeypatch):
+    monkeypatch.setenv("SHARDFLY_HCA_POLICY", "balanced")
+    monkeypatch.setenv("NCCL_IB_HCA", "=mlx5_8:1")
+
+    _configure_gin_hca_policy()
+
+    assert os.environ["NCCL_IB_HCA"] == "=mlx5_8:1"
