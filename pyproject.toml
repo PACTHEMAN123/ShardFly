@@ -1,0 +1,44 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "torch"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "shardfly"
+version = "0.1.0"
+description = "CUDA communication for sharded model weight streams"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {file = "LICENSE"}
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+integrations = ["requests", "aiohttp", "transformers", "ray", "fastapi", "uvloop"]
+
+[project.entry-points."vllm.general_plugins"]
+shardfly_adapter = "shardfly.integrations.vllm.entrypoint:register_shardfly_plugin"
+
+[tool.scikit-build]
+wheel.packages = ["python/shardfly"]
+cmake.build-type = "Release"
+
+[tool.scikit-build.cmake.define]
+SHARDFLY_BUILD_PYTHON = "ON"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["python"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# NCCL preload and Ray locality must run before importing their consumers.
+"python/shardfly/transport.py" = ["E402"]
+"python/shardfly/integrations/vllm/plugin.py" = ["E402"]
+"python/shardfly/integrations/verl/checkpoint.py" = ["E402"]

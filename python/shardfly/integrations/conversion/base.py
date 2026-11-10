@@ -1,0 +1,34 @@
+# Copyright 2026 ShardFly contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Portions derived from the Awex project (https://github.com/inclusionAI/Awex),
+# Copyright the Awex developers, licensed under the Apache License, Version 2.0.
+
+
+from shardfly import logging
+
+logger = logging.getLogger(__name__)
+
+
+def normalize_scale_inv_name(name: str) -> tuple[str, bool]:
+    suffix = "_scale_inv"
+    if name.endswith(suffix):
+        return name[: -len(suffix)], True
+    return name, False
+
+
+def append_scale_inv(name: str, has_scale_inv: bool) -> str:
+    if has_scale_inv:
+        return f"{name}_scale_inv"
+    return name

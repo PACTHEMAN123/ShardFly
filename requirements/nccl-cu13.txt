@@ -1,0 +1,2 @@
+# Pinned NCCL headers and runtime; keep both together.
+nvidia-nccl-cu13==2.31.2

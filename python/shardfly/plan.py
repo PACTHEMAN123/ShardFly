@@ -1,0 +1,1092 @@
+# Copyright 2026 ShardFly contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Portions derived from the Awex project (https://github.com/inclusionAI/Awex),
+# Copyright the Awex developers, licensed under the Apache License, Version 2.0.
+
+import json
+import math
+import os
+import time
+from dataclasses import dataclass, field
+from hashlib import sha256
+from typing import Any, Dict, Iterable, List, Tuple
+
+import torch
+
+from shardfly import logging
+from shardfly._utils.common import _is_allowed_infer_only_alias, to_dict
+from shardfly.metadata.resolver import (
+    ParameterMeta,
+    ParameterReplicaMeta,
+    ParameterShardMeta,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class CommunicationOperation:
+    """Represents a single communication operation in the weights exchange plan."""
+
+    send_rank: int
+    send_shard_meta: ParameterShardMeta
+    send_offset: Tuple[int, ...]
+    recv_rank: int
+    recv_shard_meta: ParameterShardMeta
+    recv_offset: Tuple[int, ...]
+    overlap_shape: Tuple[int, ...]
+    train_slices: Tuple[slice, ...]
+    inf_slices: Tuple[slice, ...]
+    # Destination PP stage index in infer topology.
+    pp_rank: int = 0
+    # Optional runtime placement version marker for debug/trace.
+    placement_version: int = -1
+    # Optional parameter class tag (attention/expert/dense_other).
+    param_class: str = "dense_other"
+    # Logical source span sizes for a copy-only, materialization-free layout.
+    # Empty means the canonical source tensor is one contiguous span.
+    send_tensor_span_numels: Tuple[int, ...] = ()
+    # Explicit logical replica chain, independent of inference engine boundaries.
+    replica_targets: Tuple[int, ...] = ()
+    replica_route_id: int = -1
+
+
+@dataclass(slots=True)
+class TransferPlan:
+    """Represents a transfer plan for a specific rank.
+
+    The operations dictionary maps from the opposite rank (the rank we communicate with)
+    to a list of communication operations:
+    - For training ranks: maps inference rank -> operations where this training rank sends to that inference rank
+    - For inference ranks: maps training rank -> operations where this inference rank receives from that training rank
+    """
+
+    # Backward-compatible alias to inter_operations. Existing callers use this.
+    operations: Dict[int, List[CommunicationOperation]] = field(default_factory=dict)
+    # Explicit inter transfer ops (train <-> infer).
+    inter_operations: Dict[int, List[CommunicationOperation]] = field(
+        default_factory=dict
+    )
+    # Global, small routing catalog retained even in a rank-pruned plan:
+    # (source rank, destination ranks, canonical payload bytes), indexed by ID.
+    replica_route_specs: Tuple = ()
+
+    def __post_init__(self):
+        # Compatibility bridge: accept old `operations` or new `inter_operations`.
+        if self.operations and not self.inter_operations:
+            self.inter_operations = self.operations
+        elif self.inter_operations and not self.operations:
+            self.operations = self.inter_operations
+        elif not self.operations and not self.inter_operations:
+            self.operations = {}
+            self.inter_operations = {}
+        elif self.operations != self.inter_operations:
+            logger.warning(
+                "TransferPlan initialized with both operations and inter_operations; "
+                "using inter_operations as source of truth."
+            )
+            self.operations = self.inter_operations
+
+
+@dataclass(slots=True)
+class ShardOffset:
+    shard: Any
+    start_offset: tuple
+    end_offset: tuple
+    shape: tuple
+    rank: int
+
+
+@dataclass(slots=True)
+class OverlapRegion:
+    inference_shard: ShardOffset
+    training_shard: ShardOffset
+    overlap_start: tuple
+    overlap_end: tuple
+
+
+@dataclass(slots=True)
+class NormalizedAxes:
+    """Unified rank-axis view used by planner logic."""
+
+    pp_rank: int
+    tp_rank: int
+    tp_size: int
+    ep_rank: int
+    ep_size: int
+    ep_tp_rank: int
+    ep_tp_size: int
+    attn_tp_rank: int
+    attn_tp_size: int
+
+
+class TransferPlanBuilder:
+    def __init__(
+        self,
+        infer_world_size: int,
+        train_world_size: int,
+        num_infer_engines: int = 1,
+        enable_debug_mode: bool = False,
+        strict_param_key_match: bool = False,
+        group_replicated_inference: bool = None,
+        dp_source_policy: str = None,
+        dp_source_block_bytes: int = None,
+        replica_routing: str = None,
+    ):
+        if num_infer_engines <= 0:
+            raise ValueError("num_infer_engines must be positive")
+
+        self.train_world_size = train_world_size
+        self.infer_world_size = infer_world_size
+        self.world_size = train_world_size + infer_world_size
+        self.infer_instance_world_size = infer_world_size // num_infer_engines
+        self.num_infer_engines = num_infer_engines
+        self.enable_debug_mode = enable_debug_mode
+        self.dp_source_policy = dp_source_policy or os.environ.get(
+            "SHARDFLY_DP_SOURCE_POLICY", "replica"
+        )
+        if self.dp_source_policy not in {"replica", "block", "stream"}:
+            raise ValueError("DP source policy must be replica, block or stream")
+        self.dp_source_block_bytes = int(
+            os.environ.get("SHARDFLY_DP_SOURCE_BLOCK_BYTES", str(16 * 1024 * 1024))
+            if dp_source_block_bytes is None else dp_source_block_bytes
+        )
+        if self.dp_source_block_bytes <= 0:
+            raise ValueError("DP source block bytes must be positive")
+        self.strict_param_key_match = strict_param_key_match
+        self.group_replicated_inference = (
+            os.environ.get("SHARDFLY_RING_BROADCAST", "0").lower()
+            in {"1", "true", "yes"}
+            if group_replicated_inference is None
+            else bool(group_replicated_inference)
+        )
+        self.replica_routing = replica_routing or os.environ.get(
+            "SHARDFLY_REPLICA_ROUTING", "engine"
+        )
+        if self.replica_routing not in {"engine", "logical"}:
+            raise ValueError("Replica routing must be engine or logical")
+        if self.replica_routing == "logical" and (
+            not self.group_replicated_inference or self.dp_source_policy == "block"
+        ):
+            raise ValueError("Logical replica routing requires ring broadcast and replica/stream source policy")
+        logger.info(
+            f"TransferPlanBuilder: infer_world_size: {infer_world_size}, train_world_size: {train_world_size}, world_size: {self.world_size}, "
+            f"infer_instance_world_size: {self.infer_instance_world_size}, num_infer_engines: {num_infer_engines}, "
+            f"enable_debug_mode: {enable_debug_mode}, strict_param_key_match: {strict_param_key_match}, "
+            f"group_replicated_inference: {self.group_replicated_inference}"
+        )
+
+    def build_weights_mapping_operations(
+        self,
+        inference_weights_meta: List[ParameterMeta],
+        training_weights_meta: List[ParameterMeta],
+        global_transfer_rank: int = None,
+    ) -> List[CommunicationOperation]:
+        """
+        Build the weights transfer plan.
+
+        Args:
+            inference_weights_meta: List of inference parameter metadata
+            training_weights_meta: List of training parameter metadata
+            global_transfer_rank: If provided, only build operations for this specific rank
+            is_train: If provided, indicates whether this is a training rank
+        Returns:
+            TransferPlan containing communication operations
+        """
+        # Validate input parameters
+        if not inference_weights_meta or not training_weights_meta:
+            logger.warning("Empty weights meta provided, returning empty plan")
+            return []
+
+        # Create a mapping from parameter name to ParameterMeta for both inference and training
+        inference_meta_dict = {meta.name: meta for meta in inference_weights_meta}
+        training_meta_dict = {meta.name: meta for meta in training_weights_meta}
+
+        infer_keys = set(inference_meta_dict.keys())
+        train_keys = set(training_meta_dict.keys())
+        common_params = infer_keys & train_keys
+        missing_on_infer = train_keys - infer_keys
+        extra_on_infer = infer_keys - train_keys
+        unsupported_extra_on_infer = {
+            key
+            for key in extra_on_infer
+            if not _is_allowed_infer_only_alias(key, infer_keys, train_keys)
+        }
+        if self.strict_param_key_match:
+            key_mismatch = bool(missing_on_infer or extra_on_infer)
+        else:
+            # Two-stage contract: inter transfer requires train keys to exist
+            # in infer canonical-ingress metadata.
+            # Infer-only extras are allowed only for known alias coverage.
+            key_mismatch = bool(missing_on_infer or unsupported_extra_on_infer)
+        if key_mismatch:
+            logger.error(
+                "Train/infer key mismatch for transfer plan: train=%s infer=%s "
+                "missing_on_infer=%s extra_on_infer=%s unsupported_extra_on_infer=%s strict=%s",
+                len(train_keys),
+                len(infer_keys),
+                sorted(missing_on_infer),
+                sorted(extra_on_infer),
+                sorted(unsupported_extra_on_infer),
+                self.strict_param_key_match,
+            )
+            raise ValueError(
+                "Train/infer key mismatch for transfer plan: "
+                f"train={len(train_keys)} infer={len(infer_keys)} "
+                f"missing_on_infer={sorted(missing_on_infer)} "
+                f"extra_on_infer={sorted(extra_on_infer)} "
+                f"unsupported_extra_on_infer={sorted(unsupported_extra_on_infer)} "
+                f"strict={self.strict_param_key_match}"
+            )
+        if extra_on_infer:
+            logger.info(
+                "Infer metadata has extra keys (ignored for inter plan in non-strict mode), "
+                "count=%s sample=%s",
+                len(extra_on_infer),
+                sorted(extra_on_infer)[:8],
+            )
+
+        if self.replica_routing == "logical":
+            from shardfly.replicas import build_logical_replica_operations
+
+            return build_logical_replica_operations(
+                self, inference_meta_dict, training_meta_dict,
+                sorted(common_params), global_transfer_rank,
+            )
+
+        communication_plan = []
+        grouped_replica_loads: Dict[Tuple[int, ...], int] = {}
+        source_loads: Dict[int, int] = {}
+        stream_assignments = (
+            self._partition_dp_streams(training_meta_dict, inference_meta_dict, common_params)
+            if self.dp_source_policy == "stream" else {}
+        )
+
+        for param_name in sorted(common_params):
+            inference_meta = inference_meta_dict[param_name]
+            training_meta = training_meta_dict[param_name]
+            if param_name in stream_assignments:
+                param_plan = self._build_dp_stream_operations(
+                    inference_meta, training_meta, stream_assignments[param_name]
+                )
+                communication_plan.extend(
+                    op for op in param_plan
+                    if global_transfer_rank is None
+                    or global_transfer_rank in (op.send_rank, op.recv_rank)
+                )
+                continue
+            if self.dp_source_policy == "block" and any(
+                getattr(shard, "dp_size", 1) > 1 for shard in training_meta.shards
+            ):
+                param_plan = self._build_dp_block_operations(
+                    inference_meta, training_meta, source_loads
+                )
+                if param_plan is not None:
+                    # Assignment is global and deterministic, including when callers
+                    # request a pruned local plan for large models.
+                    communication_plan.extend(
+                        op for op in param_plan
+                        if global_transfer_rank is None
+                        or global_transfer_rank in (op.send_rank, op.recv_rank)
+                    )
+                    continue
+            grouped_train_replica_indices = None
+            if (
+                self.group_replicated_inference
+                and inference_meta.replicas
+                and training_meta.replicas
+            ):
+                replica_count = len(training_meta.replicas)
+                replica_keys = [
+                    tuple(sorted(int(shard.global_rank) for shard in replica.shards))
+                    for replica in training_meta.replicas
+                ]
+                parameter_bytes = int(training_meta.global_numel) * _dtype_element_size(
+                    training_meta.dtype
+                )
+                grouped_train_replica_indices = []
+                for _ in inference_meta.replicas:
+                    train_replica_idx = min(
+                        range(replica_count),
+                        key=lambda index: (
+                            grouped_replica_loads.get(replica_keys[index], 0),
+                            replica_keys[index],
+                            index,
+                        ),
+                    )
+                    grouped_train_replica_indices.append(train_replica_idx)
+                    replica_key = replica_keys[train_replica_idx]
+                    grouped_replica_loads[replica_key] = (
+                        grouped_replica_loads.get(replica_key, 0) + parameter_bytes
+                    )
+
+            # Build communication plan for this parameter
+            param_plan = self._build_parameter_communication_plan(
+                param_name,
+                inference_meta,
+                training_meta,
+                global_transfer_rank=global_transfer_rank,
+                grouped_train_replica_indices=grouped_train_replica_indices,
+            )
+            communication_plan.extend(param_plan)
+
+        logger.info(
+            f"Built communication plan with {len(communication_plan)} operations "
+            f"for {len(common_params)} common parameters"
+        )
+        return communication_plan
+
+    @staticmethod
+    def _shard_geometry(shard):
+        return (tuple(shard.global_offset), tuple(shard.shape), shard.dtype)
+
+    def _partition_dp_streams(self, training_meta_dict, inference_meta_dict, common_params):
+        """Partition each corresponding rank group, independent of node count.
+
+        Parameters with the same physical source candidates share a logical
+        stream in name/geometry order. DP replicas receive equal byte ranges;
+        equivalent CP copies divide each DP range equally. Only partition
+        boundaries split tensors. No packed buffer is materialized.
+        """
+        groups, assignments = {}, {}
+        for name in sorted(common_params):
+            meta = training_meta_dict[name]
+            if not any(s.dp_size > 1 for s in meta.shards) or len(meta.replicas) < 2:
+                continue
+            canonical = meta.replicas[0]
+            keys = {self._shard_geometry(s) for s in canonical.shards}
+            if len(keys) != len(canonical.shards) or any(
+                len(replica.shards) != len(keys)
+                or {self._shard_geometry(s) for s in replica.shards} != keys
+                for replica in meta.replicas
+            ):
+                continue
+            candidates = {key: {} for key in keys}
+            for shard in meta.shards:
+                candidates[self._shard_geometry(shard)][shard.global_rank] = shard
+            # Incomplete/ambiguous DP metadata keeps the original replica plan.
+            if any(
+                {s.dp_rank for s in sources.values()} != set(range(next(iter(sources.values())).dp_size))
+                for sources in candidates.values()
+            ):
+                continue
+            assignments[name] = {}
+            for shard in sorted(canonical.shards, key=lambda s: (s.global_offset, s.shape)):
+                geometry = self._shard_geometry(shard)
+                sources = sorted(candidates[geometry].values(),
+                                 key=lambda s: (s.dp_rank, s.cp_rank, s.global_rank))
+                group_key = tuple((s.dp_rank, s.global_rank) for s in sources)
+                row_bytes = math.prod(shard.shape[1:]) * _dtype_element_size(meta.dtype)
+                groups.setdefault(group_key, []).append((name, geometry, sources, row_bytes))
+                assignments[name][geometry] = []
+
+        loads, dp_loads = {}, {}
+        fragments = split_regions = 0
+        for group_key, entries in groups.items():
+            total = sum(geometry[1][0] * row_bytes for _, geometry, _, row_bytes in entries)
+            dp_ids = sorted({dp for dp, _ in group_key})
+            counts = {dp: sum(d == dp for d, _ in group_key) for dp in dp_ids}
+            # Inner CP partitions preserve the outer equal-DP allocation even
+            # if different DP replicas have different numbers of CP copies.
+            boundaries = [0]
+            for dp_index, dp in enumerate(dp_ids):
+                for index in range(1, counts[dp] + 1):
+                    boundaries.append(total * (dp_index * counts[dp] + index)
+                                      // (len(dp_ids) * counts[dp]))
+            cursor = 0
+            for name, geometry, sources, row_bytes in entries:
+                offset, shape, _ = geometry
+                alignment = 128 if str(inference_meta_dict[name].dtype).startswith("torch.float8") and len(shape) > 1 else 1
+                # Floor a boundary to a source row (or FP8 row block). Clamp
+                # to this parameter so a boundary on an edge creates no split.
+                cuts = [max(0, min(shape[0], (boundary - cursor) // (row_bytes * alignment) * alignment))
+                        for boundary in boundaries]
+                cuts[0], cuts[-1] = 0, shape[0]
+                pieces = assignments[name][geometry]
+                for source, start, end in zip(sources, cuts, cuts[1:]):
+                    if start == end:
+                        continue
+                    pieces.append((source, offset[0] + start, offset[0] + end))
+                    nbytes = (end - start) * row_bytes
+                    loads[source.global_rank] = loads.get(source.global_rank, 0) + nbytes
+                    dp_loads[source.dp_rank] = dp_loads.get(source.dp_rank, 0) + nbytes
+                fragments += len(pieces)
+                split_regions += len(pieces) > 1
+                cursor += shape[0] * row_bytes
+        self.dp_stream_stats = dict(groups=len(groups), shard_regions=sum(map(len, groups.values())),
+                                    fragments=fragments, split_regions=split_regions,
+                                    bytes_by_rank=loads, bytes_by_dp=dp_loads)
+        logger.info("SHARDFLY_DP_STREAM_PLAN " + json.dumps(self.dp_stream_stats, sort_keys=True))
+        return assignments
+
+    def _build_dp_stream_operations(self, inference_meta, training_meta, assignments):
+        training_map = self._create_shard_offset_for_replica(training_meta.replicas[0], 0, False)
+        plan = []
+        for engine in range(self.num_infer_engines):
+            for replica in inference_meta.replicas:
+                inference_map = self._create_shard_offset_for_replica(replica, engine, True)
+                for region in self._find_overlapping_regions(inference_map, training_map):
+                    for source, start, end in assignments[self._shard_geometry(region.training_shard.shard)]:
+                        start = max(start, region.overlap_start[0])
+                        end = min(end, region.overlap_end[0])
+                        if start >= end:
+                            continue
+                        source_offset = ShardOffset(
+                            shard=source, start_offset=source.global_offset,
+                            end_offset=region.training_shard.end_offset, shape=source.shape,
+                            rank=self._compute_shard_transfer_rank(source, 0, False),
+                        )
+                        plan.extend(self._build_region_communication_plan(OverlapRegion(
+                            inference_shard=region.inference_shard, training_shard=source_offset,
+                            overlap_start=(start, *region.overlap_start[1:]),
+                            overlap_end=(end, *region.overlap_end[1:]),
+                        )))
+        return plan
+
+    def _build_dp_block_operations(self, inference_meta, training_meta, source_loads):
+        """Stripe disjoint destination regions over equivalent training shards.
+
+        A canonical replica supplies geometry only. Each physical source must
+        cover exactly the same shard region; different replica geometries retain
+        the existing replica planner. CP copies may also serve a DP-replicated
+        shard. Ring engines share one assignment and are charged only once.
+        """
+        def geometry(shard):
+            return (tuple(shard.global_offset), tuple(shard.shape), shard.dtype)
+
+        replicas = training_meta.replicas
+        if len(replicas) < 2:
+            return None
+        canonical = replicas[0]
+        keys = {geometry(shard) for shard in canonical.shards}
+        if len(keys) != len(canonical.shards) or any(
+            {geometry(shard) for shard in replica.shards} != keys
+            or len(replica.shards) != len(keys) for replica in replicas
+        ):
+            return None
+        candidates = {key: {} for key in keys}
+        for shard in training_meta.shards:
+            candidates[geometry(shard)][int(shard.global_rank)] = shard
+        training_map = self._create_shard_offset_for_replica(canonical, 0, False)
+        plan = []
+        assignments = {}
+        for engine_rank in range(self.num_infer_engines):
+            for replica_idx, replica in enumerate(inference_meta.replicas):
+                inference_map = self._create_shard_offset_for_replica(
+                    replica, engine_rank, True
+                )
+                for region in self._find_overlapping_regions(inference_map, training_map):
+                    shape = tuple(b - a for a, b in zip(region.overlap_start, region.overlap_end))
+                    # Keep the innermost dimension intact for contiguous rows and
+                    # the existing strided-copy/device-layout lowering. FP8 uses
+                    # 128-row blocks, so conservatively retain that alignment.
+                    axis = 0
+                    alignment = 128 if str(inference_meta.dtype).startswith("torch.float8") and len(shape) > 1 else 1
+                    row_bytes = math.prod(shape[1:]) * _dtype_element_size(training_meta.dtype)
+                    rows = max(alignment, self.dp_source_block_bytes // row_bytes // alignment * alignment)
+                    sources = candidates[geometry(region.training_shard.shard)]
+                    for start in range(region.overlap_start[axis], region.overlap_end[axis], rows):
+                        block_start = (start, *region.overlap_start[1:])
+                        block_end = (min(start + rows, region.overlap_end[0]), *region.overlap_end[1:])
+                        key = (replica_idx, region.inference_shard.shard.global_rank,
+                               block_start, block_end)
+                        if not self.group_replicated_inference or key not in assignments:
+                            rank = min(sources, key=lambda rank: (source_loads.get(rank, 0), rank))
+                            block_bytes = math.prod(b - a for a, b in zip(block_start, block_end)) * _dtype_element_size(training_meta.dtype)
+                            source_loads[rank] = source_loads.get(rank, 0) + block_bytes
+                            assignments[key] = rank
+                        source = sources[assignments[key]]
+                        source_offset = ShardOffset(
+                            shard=source, start_offset=source.global_offset,
+                            end_offset=region.training_shard.end_offset,
+                            shape=source.shape,
+                            rank=self._compute_shard_transfer_rank(source, 0, False),
+                        )
+                        plan.extend(self._build_region_communication_plan(OverlapRegion(
+                            inference_shard=region.inference_shard,
+                            training_shard=source_offset,
+                            overlap_start=block_start, overlap_end=block_end,
+                        )))
+        return plan
+
+    def _build_parameter_communication_plan(
+        self,
+        param_name: str,
+        inference_meta: ParameterMeta,
+        training_meta: ParameterMeta,
+        global_transfer_rank: int = None,
+        grouped_train_replica_indices: List[int] = None,
+    ) -> List[CommunicationOperation]:
+        """
+        Build communication plan for a single parameter for a specific rank.
+
+        This method handles multiple replicas by:
+        1. Getting all replicas from both inference and training ParameterMeta
+        2. Assigning training replicas to inference replicas evenly using round-robin
+        3. For each replica pair, finding overlapping regions and building communication operations
+        4. Each inference replica receives tensors from one assigned training replica
+
+        Args:
+            param_name: Name of the parameter
+            inference_meta: Inference parameter metadata with replicas
+            training_meta: Training parameter metadata with replicas
+
+        Returns:
+            List of communication operations for this parameter
+        """
+        plan = []
+
+        # Get the replicas for both inference and training
+        inference_replicas = []
+        for engine_rank in range(self.num_infer_engines):
+            inference_replicas.extend(
+                (engine_rank, replica) for replica in inference_meta.replicas
+            )
+        training_replicas = training_meta.replicas
+
+        if not inference_replicas or not training_replicas:
+            raise ValueError(f"No replicas found for parameter {param_name}")
+
+        # Assign training replicas to inference replicas using proper distribution
+        num_inference_replicas = len(inference_replicas)
+        num_training_replicas = len(training_replicas)
+
+        # Ensure each inference replica is assigned to exactly one training replica
+        # and each training replica gets an equal number of inference replicas
+        replica_assignments = []
+
+        replicas_per_engine = len(inference_meta.replicas)
+        if grouped_train_replica_indices is not None:
+            if len(grouped_train_replica_indices) != replicas_per_engine:
+                raise ValueError(
+                    "grouped_train_replica_indices must have one entry per "
+                    "logical inference replica"
+                )
+            if any(
+                index < 0 or index >= num_training_replicas
+                for index in grouped_train_replica_indices
+            ):
+                raise ValueError(
+                    "grouped_train_replica_indices contains an invalid training "
+                    "replica index"
+                )
+        for inf_replica_idx in range(num_inference_replicas):
+            if self.group_replicated_inference:
+                # Equivalent logical replicas across inference engines must use
+                # the same source replica so Transport can lower one root
+                # injection followed by a replica ring.
+                logical_replica_idx = inf_replica_idx % replicas_per_engine
+                train_replica_idx = (
+                    grouped_train_replica_indices[logical_replica_idx]
+                    if grouped_train_replica_indices is not None
+                    else logical_replica_idx % num_training_replicas
+                )
+            else:
+                train_replica_idx = inf_replica_idx % num_training_replicas
+            replica_assignments.append((inf_replica_idx, train_replica_idx))
+
+        logger.debug(
+            f"Parameter {param_name}: Assigned {num_inference_replicas} inference replicas "
+            f"to {num_training_replicas} training replicas: {replica_assignments}"
+        )
+
+        # Build communication plan for each replica pair
+        for inf_replica_idx, train_replica_idx in replica_assignments:
+            engine_rank, inference_replica = inference_replicas[inf_replica_idx]
+            training_replica = training_replicas[train_replica_idx]
+            is_infer_rank = (
+                global_transfer_rank is not None
+                and global_transfer_rank < self.infer_world_size
+            )
+            is_train_rank = (
+                global_transfer_rank is not None
+                and global_transfer_rank >= self.infer_world_size
+            )
+            reused_shape_obj = [None] * len(training_replica.shards[0].shape)
+            # Create a mapping from global offset ranges to shards for both inference and training replicas
+            inference_shard_offsets = self._create_shard_offset_for_replica(
+                inference_replica,
+                engine_rank,
+                is_infer=True,
+                global_transfer_rank=global_transfer_rank if is_infer_rank else None,
+                reused_shape_obj=reused_shape_obj,
+            )
+            training_shard_offsets = self._create_shard_offset_for_replica(
+                training_replica,
+                0,
+                is_infer=False,
+                global_transfer_rank=global_transfer_rank if is_train_rank else None,
+                reused_shape_obj=reused_shape_obj,
+            )
+
+            # Find overlapping regions between inference and training shards
+            overlapping_regions = self._find_overlapping_regions(
+                inference_shard_offsets,
+                training_shard_offsets,
+            )
+            for region in overlapping_regions:
+                region_plan = self._build_region_communication_plan(
+                    region, reused_shape_obj
+                )
+                plan.extend(region_plan)
+
+        return plan
+
+    def _create_shard_offset_for_replica(
+        self,
+        replica: ParameterReplicaMeta,
+        engine_rank: int,
+        is_infer: bool,
+        global_transfer_rank: int = None,
+        reused_shape_obj=None,
+    ) -> List[ShardOffset]:
+        """
+        Create a mapping from offset ranges to shards for a specific replica.
+
+        Args:
+            replica: ParameterReplicaMeta containing a list of shards
+            is_infer: Whether this is for inference replicas
+
+        Returns:
+            List of dictionaries containing shard information with offset ranges
+        """
+        assert is_infer is not None, (
+            "is_infer must be provided if global_transfer_rank is provided"
+        )
+        shard_map = []
+        reused_shape_obj = reused_shape_obj or [None] * len(replica.shards[0].shape)
+
+        if not replica.shards:
+            raise ValueError("No shards found for replica")
+
+        for shard in replica.shards:
+            # Validate that global_offset is not empty
+            if not shard.global_offset:
+                raise ValueError("Shard has empty global_offset")
+
+            # Validate that global_offset and shape have the same number of dimensions
+            if len(shard.global_offset) != len(shard.shape):
+                raise ValueError(
+                    f"Dimension mismatch for shard in replica: "
+                    f"global_offset has {len(shard.global_offset)} dims, shape has {len(shard.shape)} dims"
+                )
+            shard_transfer_rank = self._compute_shard_transfer_rank(
+                shard, engine_rank, is_infer
+            )
+            if (
+                global_transfer_rank is not None
+                and shard_transfer_rank != global_transfer_rank
+            ):
+                continue
+
+            # Calculate the end offset for this shard
+            for i in range(len(shard.global_offset)):
+                reused_shape_obj[i] = shard.global_offset[i] + shard.shape[i]
+            end_offset = tuple(reused_shape_obj)
+            shard_map.append(
+                ShardOffset(
+                    shard=shard,
+                    start_offset=shard.global_offset,
+                    end_offset=end_offset,
+                    shape=shard.shape,
+                    rank=shard_transfer_rank,
+                )
+            )
+
+        return shard_map
+
+    def _compute_shard_transfer_rank(
+        self, shard: ParameterShardMeta, engine_rank: int, is_infer: bool
+    ) -> int:
+        if is_infer:
+            return shard.global_rank + engine_rank * self.infer_instance_world_size
+        else:
+            assert engine_rank == 0, "Training only has one engine instance"
+            return shard.global_rank + self.infer_world_size
+
+    def _find_overlapping_regions(
+        self,
+        inference_map: List[ShardOffset],
+        training_map: List[ShardOffset],
+    ) -> List[OverlapRegion]:
+        """Find overlapping regions between inference and training shards."""
+        overlapping_regions = []
+
+        for inf_shard_offset in inference_map:
+            for train_shard_offset in training_map:
+                # Check if shards overlap in all dimensions
+                overlap_start = []
+                overlap_end = []
+                has_overlap = True
+
+                for dim in range(len(inf_shard_offset.start_offset)):
+                    start = max(
+                        inf_shard_offset.start_offset[dim],
+                        train_shard_offset.start_offset[dim],
+                    )
+                    end = min(
+                        inf_shard_offset.end_offset[dim],
+                        train_shard_offset.end_offset[dim],
+                    )
+
+                    if start >= end:
+                        has_overlap = False
+                        break
+
+                    overlap_start.append(start)
+                    overlap_end.append(end)
+
+                if has_overlap:
+                    overlapping_regions.append(
+                        OverlapRegion(
+                            inference_shard=inf_shard_offset,
+                            training_shard=train_shard_offset,
+                            overlap_start=tuple(overlap_start),
+                            overlap_end=tuple(overlap_end),
+                        )
+                    )
+
+        return overlapping_regions
+
+    def _build_region_communication_plan(
+        self,
+        region: OverlapRegion,
+        reused_shape_obj: List = None,
+    ) -> List[CommunicationOperation]:
+        """Build communication plan for an overlapping region."""
+        plan = []
+
+        inf_shard_offset = region.inference_shard
+        train_shard_offset = region.training_shard
+        overlap_start = region.overlap_start
+        overlap_end = region.overlap_end
+        reused_shape_obj = reused_shape_obj or [None] * len(
+            region.inference_shard.shape
+        )
+
+        # Calculate the shape of the overlapping region
+        overlap_shape = tuple(
+            overlap_end[i] - overlap_start[i] for i in range(len(overlap_start))
+        )
+
+        # Calculate relative offsets within each shard
+        for i in range(len(overlap_start)):
+            reused_shape_obj[i] = overlap_start[i] - inf_shard_offset.start_offset[i]
+        inf_relative_offset = tuple(reused_shape_obj)
+
+        for i in range(len(overlap_start)):
+            reused_shape_obj[i] = overlap_start[i] - train_shard_offset.start_offset[i]
+        train_relative_offset = tuple(reused_shape_obj)
+
+        # Create conversion functions for both training (sender) and inference (receiver)
+        # Each side may need to slice if their shard is larger than the overlapping region
+        for i in range(len(reused_shape_obj)):
+            reused_shape_obj[i] = slice(
+                train_relative_offset[i], train_relative_offset[i] + overlap_shape[i]
+            )
+        train_slices = tuple(reused_shape_obj)
+        for i in range(len(reused_shape_obj)):
+            reused_shape_obj[i] = slice(
+                inf_relative_offset[i], inf_relative_offset[i] + overlap_shape[i]
+            )
+        infer_slices = tuple(reused_shape_obj)
+
+        # Add to communication plan
+        # Training is sender, inference is receiver
+        # Only transfer the overlapping region
+        send_rank = train_shard_offset.rank
+        recv_rank = inf_shard_offset.rank
+        assert send_rank != recv_rank, "Send and recv rank cannot be the same"
+        assert send_rank >= self.infer_world_size, (
+            f"Send rank {send_rank} is not in training world {self.infer_world_size, self.world_size}"
+        )
+        assert recv_rank < self.infer_world_size, (
+            f"Recv rank {recv_rank} is not in inference world {0, self.infer_world_size}"
+        )
+        plan.append(
+            CommunicationOperation(
+                send_rank=send_rank,
+                send_shard_meta=train_shard_offset.shard,
+                send_offset=train_relative_offset,
+                recv_rank=recv_rank,
+                recv_shard_meta=inf_shard_offset.shard,
+                recv_offset=inf_relative_offset,
+                overlap_shape=overlap_shape,
+                train_slices=train_slices,
+                inf_slices=infer_slices,
+            )
+        )
+
+        return plan
+
+    def _group_operations_by_rank(
+        self, operations: List[CommunicationOperation], key_name: str
+    ) -> Dict[int, List[CommunicationOperation]]:
+        grouped_operations = {}
+        for operation in operations:
+            key = getattr(operation, key_name)
+            if key not in grouped_operations:
+                grouped_operations[key] = []
+            grouped_operations[key].append(operation)
+
+        # Sort operations within each group to ensure consistent ordering
+        for key in grouped_operations:
+            grouped_operations[key].sort(
+                key=lambda op: (
+                    op.send_shard_meta.name,  # Sort by parameter name first
+                    op.send_offset,  # Then by send offset
+                    op.recv_offset,  # Then by recv offset
+                )
+            )
+        # Sort the keys to ensure consistent iteration order
+        sorted_grouped_operations = {}
+        for key in sorted(grouped_operations.keys()):
+            sorted_grouped_operations[key] = grouped_operations[key]
+        return sorted_grouped_operations
+
+    def build_local_transfer_plan(
+        self,
+        inference_weights_meta: List[ParameterMeta],
+        training_weights_meta: List[ParameterMeta],
+        global_transfer_rank: int,
+    ) -> TransferPlan:
+        is_train = global_transfer_rank >= self.infer_world_size
+        name = "train" if is_train else "infer"
+        start_time = time.time()
+        logger.info(
+            f"Rank[{global_transfer_rank}] Building local transfer plan for {name}"
+        )
+        num_infer_shards = (
+            sum(
+                len(replica.shards)
+                for param in inference_weights_meta
+                for replica in param.replicas
+            )
+            * self.num_infer_engines
+        )
+        num_train_shards = sum(
+            len(replica.shards)
+            for param in training_weights_meta
+            for replica in param.replicas
+        )
+        logger.info(
+            f"Rank[{global_transfer_rank}] Number of inference shards: {num_infer_shards}, number of training shards: {num_train_shards}"
+        )
+        total_shards = num_infer_shards + num_train_shards
+        prune_threshold = 10000
+        if total_shards > prune_threshold:
+            logger.info(
+                f"Rank[{global_transfer_rank}] Pruning global transfer plan for {name} because number of shards is too large: {total_shards}"
+            )
+            operations = self.build_weights_mapping_operations(
+                inference_weights_meta,
+                training_weights_meta,
+                global_transfer_rank=global_transfer_rank,
+            )
+        else:
+            logger.info(
+                f"Rank[{global_transfer_rank}] Building global transfer plan for {name} because number of shards is small: {total_shards}"
+            )
+            operations = self.build_weights_mapping_operations(
+                inference_weights_meta, training_weights_meta
+            )
+        if self.enable_debug_mode:
+            data = to_dict(operations)
+            file_name = f"global_communication_plan_{name}_{global_transfer_rank}_{os.getpid()}.json"
+            with open(file_name, "w") as f:
+                json.dump(data, f, indent=2)
+            logger.info(
+                f"Rank[{global_transfer_rank}] Saved communication plan to {os.path.abspath(file_name)}"
+            )
+
+        # Filter operations for this specific rank
+        new_operations = []
+        for operation in operations:
+            if is_train:
+                # For training ranks, only include operations where this rank is the sender
+                if operation.send_rank == global_transfer_rank:
+                    new_operations.append(operation)
+            else:
+                # For inference ranks, only include operations where this rank is the receiver
+                if operation.recv_rank == global_transfer_rank:
+                    new_operations.append(operation)
+
+        # Group operations by the opposite rank (the rank we communicate with)
+        # For training ranks: group by recv_rank (the inference rank we send to)
+        # For inference ranks: group by send_rank (the training rank we receive from)
+        key = "recv_rank" if is_train else "send_rank"
+        grouped_operations = self._group_operations_by_rank(new_operations, key)
+
+        # Validate that all operations in the grouped plan are for this specific rank
+        for ops in grouped_operations.values():
+            for op in ops:
+                if is_train:
+                    assert op.send_rank == global_transfer_rank, (
+                        f"Training rank {global_transfer_rank} local plan contains operation "
+                        f"with send_rank {op.send_rank} instead of {global_transfer_rank}"
+                    )
+                else:
+                    assert op.recv_rank == global_transfer_rank, (
+                        f"Inference rank {global_transfer_rank} local plan contains operation "
+                        f"with recv_rank {op.recv_rank} instead of {global_transfer_rank}"
+                    )
+        duration = time.time() - start_time
+        logger.info(
+            f"Rank[{global_transfer_rank}] ({'training' if is_train else 'inference'}) "
+            f"local plan has {len(new_operations)} operations grouped by {len(grouped_operations)} "
+            f"opposite ranks: {list(grouped_operations.keys())}, "
+            f"global operations across all ranks: {len(operations)}, "
+            f"took time: {duration:.2f} seconds"
+        )
+
+        if self.enable_debug_mode:
+            data = to_dict(grouped_operations)
+            file_name = f"local_communication_plan_{name}_{global_transfer_rank}_{os.getpid()}.json"
+            with open(file_name, "w") as f:
+                json.dump(data, f, indent=2)
+            logger.info(
+                f"Rank[{global_transfer_rank}] Saved communication plan to {os.path.abspath(file_name)}"
+            )
+        return TransferPlan(inter_operations=grouped_operations,
+                            replica_route_specs=getattr(self, "logical_replica_routes", ()))
+
+
+@torch.no_grad()
+def slice_tensor(
+    tensor: torch.Tensor, op: CommunicationOperation, is_train, **kwargs
+) -> torch.Tensor:
+    """
+    Slice the overlapping region from the source tensor.
+
+    Args:
+        tensor: The source tensor to slice
+
+    Returns:
+        The sliced tensor containing only the overlapping region
+    """
+    slices = op.train_slices if is_train else op.inf_slices
+    sliced_tensor = tensor[slices]
+    if not is_train:
+        # sliced_tensor for infer may not be contiguous
+        return sliced_tensor
+    if not sliced_tensor.is_contiguous():
+        param_name = op.send_shard_meta.name
+        source_offset = op.send_offset if is_train else op.recv_offset
+        if is_train:
+            slice_context = kwargs.get("slice_context", {})
+            key = f"{param_name}-{slices}"
+            sliced = slice_context.get(key)
+            if sliced is not None:
+                return sliced
+            sliced = sliced_tensor.contiguous()
+            slice_context[key] = sliced
+            return sliced
+        else:
+            msg = (
+                f"Sliced tensor is not contiguous, param_name: {param_name}, "
+                f"inference_meta: {op.recv_shard_meta}, training_meta: {op.send_shard_meta}, "
+                f"source_offset: {source_offset}, overlap_shape: {op.overlap_shape}, "
+                f"tensor shape: {tensor.shape}, slices: {slices}, contiguous: {tensor.is_contiguous()}"
+            )
+            raise ValueError(msg)
+    return sliced_tensor
+
+
+def compute_transfer_plan_hash(
+    transfer_plan: TransferPlan,
+) -> str:
+    """Create a deterministic hash for plan observability/debugging."""
+
+    def _slice_tuple(slices: Iterable[slice]) -> Tuple[Tuple[int, int, int], ...]:
+        return tuple((s.start, s.stop, s.step or 1) for s in slices)
+
+    payload = {"inter": [], "replica_routes": transfer_plan.replica_route_specs}
+    for peer_rank in sorted(transfer_plan.inter_operations.keys()):
+        for op in transfer_plan.inter_operations[peer_rank]:
+            payload["inter"].append(
+                (
+                    peer_rank,
+                    op.send_rank,
+                    op.recv_rank,
+                    op.send_shard_meta.name,
+                    op.recv_shard_meta.name,
+                    tuple(op.send_offset),
+                    tuple(op.recv_offset),
+                    tuple(op.overlap_shape),
+                    _slice_tuple(op.train_slices),
+                    _slice_tuple(op.inf_slices),
+                    op.pp_rank,
+                    op.placement_version,
+                    op.param_class,
+                    tuple(op.send_tensor_span_numels),
+                    tuple(op.replica_targets),
+                    op.replica_route_id,
+                )
+            )
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _shape_numel(shape: Iterable[int]) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    return numel
+
+
+def _dtype_element_size(dtype: Any) -> int:
+    if isinstance(dtype, torch.dtype):
+        return torch.empty((), dtype=dtype).element_size()
+    if isinstance(dtype, str):
+        normalized = dtype.replace("torch.", "")
+        maybe_dtype = getattr(torch, normalized, None)
+        if isinstance(maybe_dtype, torch.dtype):
+            return torch.empty((), dtype=maybe_dtype).element_size()
+    # Keep a conservative default for unknown dtypes.
+    return 4
+
+
+def compute_transfer_plan_stats(
+    transfer_plan: TransferPlan,
+) -> Dict[str, Any]:
+    """Return structured observability stats for a transfer plan."""
+    inter_ops = 0
+    inter_numel = 0
+    inter_bytes = 0
+    for ops in transfer_plan.inter_operations.values():
+        inter_ops += len(ops)
+        for op in ops:
+            op_numel = _shape_numel(op.overlap_shape)
+            inter_numel += op_numel
+            inter_bytes += op_numel * _dtype_element_size(op.send_shard_meta.dtype)
+
+    total_ops = inter_ops
+    total_numel = inter_numel
+    total_bytes = inter_bytes
+    return {
+        "inter_hash": compute_transfer_plan_hash(transfer_plan),
+        "full_hash": compute_transfer_plan_hash(transfer_plan),
+        "inter": {
+            "peer_count": len(transfer_plan.inter_operations),
+            "op_count": inter_ops,
+            "numel": inter_numel,
+            "bytes": inter_bytes,
+        },
+        "total": {
+            "op_count": total_ops,
+            "numel": total_numel,
+            "bytes": total_bytes,
+        },
+    }
