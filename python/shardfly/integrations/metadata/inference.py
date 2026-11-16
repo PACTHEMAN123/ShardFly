@@ -22,6 +22,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
 from shardfly._utils.common import to_dict
+from shardfly.integrations.loader_capture import CAPTURE_ATTRIBUTE
+from shardfly.integrations.metadata.loader_capture import build_captured_parameters_meta
 from shardfly.integrations.models.registry import get_infer_weights_converter
 from shardfly.integrations.sharding import (
     get_rank_info_extractor,
@@ -93,13 +95,20 @@ class InferParamMetaResolver(ParamMetaResolver):
         self._rank0_meta = self._select_canonical_rank0_meta(self._params_raw_meta)
         self.rank0_info = self._rank0_meta["rank_info"]
         self._model_arch_name = self._rank0_meta["model_arch_name"]
-        self._sharding_strategy = get_sharding_strategy_builder(self.engine_name)(
-            self._model_arch_name,
-            self.infer_engine_config,
-            self.rank0_info,
-            hf_config=self.hf_config,
-        )
-        self._params_meta = self._build_params_meta()
+        capture_modes = {info.get("loader_capture", False) for info in self._params_raw_meta}
+        if len(capture_modes) != 1:
+            raise ValueError("Inference workers disagree on loader capture mode")
+        self.uses_loader_capture = capture_modes.pop()
+        if self.uses_loader_capture:
+            self._params_meta = build_captured_parameters_meta(self._params_raw_meta)
+        else:
+            self._sharding_strategy = get_sharding_strategy_builder(self.engine_name)(
+                self._model_arch_name,
+                self.infer_engine_config,
+                self.rank0_info,
+                hf_config=self.hf_config,
+            )
+            self._params_meta = self._build_params_meta()
         if self._inference_engine.config.enable_debug_mode:
             filename = f"infer_params_meta_{suffix}"
             abs_filename = os.path.abspath(filename)
@@ -210,23 +219,31 @@ class InferParamMetaResolver(ParamMetaResolver):
             "params_meta": params_meta,
             "model_arch_name": model_arch_name,
         }
-        infer_to_hf_weight_converter = get_infer_weights_converter(
-            engine_name,
-            model_arch_name,
-            hf_config=hf_config,
-            infer_engine_config=infer_engine_config,
-            rank_info=rank_info,
-        )
+        if convert_params and (capture := getattr(model, CAPTURE_ATTRIBUTE, None)) is not None:
+            captured = capture.metadata(model)
+            if (
+                getattr(hf_config, "tie_word_embeddings", False)
+                and rank_info.pp_rank == rank_info.pp_size - 1
+            ):
+                by_name = {param["name"]: param for param in captured}
+                if "model.embed_tokens.weight" in by_name and "lm_head.weight" not in by_name:
+                    captured.append(dict(by_name["model.embed_tokens.weight"], name="lm_head.weight"))
+            return dict(meta, loader_capture=True, params_meta=captured)
+
         params = []
-        for name, param in model.named_parameters():
-            if convert_params:
+        if convert_params:
+            infer_to_hf_weight_converter = get_infer_weights_converter(
+                engine_name,
+                model_arch_name,
+                hf_config=hf_config,
+                infer_engine_config=infer_engine_config,
+                rank_info=rank_info,
+            )
+            for name, param in model.named_parameters():
                 for hf_name, hf_param in infer_to_hf_weight_converter.convert_param(
                     name, param
                 ):
                     params.append((hf_name, hf_param))
-            else:
-                params.append((name, param))
-        if convert_params:
             if getattr(hf_config, "tie_word_embeddings", False):
                 pp_rank = model_context.get("pp_rank", 0)
                 pp_size = model_context.get("pp_size", 1)
@@ -247,6 +264,8 @@ class InferParamMetaResolver(ParamMetaResolver):
                             "Infer meta: added lm_head.weight alias for tied embeddings on %s",
                             engine_name,
                         )
+        else:
+            params.extend(model.named_parameters())
         if os.environ.get("SHARDFLY_DEBUG_INFER_META", "0") == "1":
             names = [n for (n, _) in params]
             has_lm_head = any(

@@ -39,6 +39,7 @@ from shardfly._utils.tensor import (
     compare_and_log_tensor_differences,
 )
 from shardfly.control.store import MetaServerClient
+from shardfly.integrations.loader_capture import CAPTURE_ATTRIBUTE
 from shardfly.integrations.metadata.inference import InferParamMetaResolver
 from shardfly.integrations.models.registry import get_infer_weights_converter
 from shardfly.integrations.sharding import get_rank_info_extractor
@@ -162,6 +163,8 @@ class WeightsReader(WeightExchangeReader):
             "expected_pp_ranks": self.expected_pp_ranks,
             "device_backend": device_util.get_device_type(),
         }
+        if getattr(self.meta_resolver, "uses_loader_capture", False):
+            self.infer_conf["loader_capture"] = True
         if self.model_arch_name == "Glm4MoeLiteForCausalLM":
             # The draft may share embedding/head storage with the main model.
             # Publish only distinct targets discovered from its actual weights.
@@ -180,6 +183,15 @@ class WeightsReader(WeightExchangeReader):
                 "infer_params_meta", self.parameters_meta
             )
             logger.info("Put inference parameters meta to meta server")
+        elif self.infer_conf.get("loader_capture", False):
+            reference = self.meta_server_client.get_object(
+                "infer_params_meta", timeout=self.timeout
+            )
+            if self.parameters_meta != [
+                parameter.fast_copy_with_engine_rank(self.engine_rank)
+                for parameter in reference
+            ]:
+                raise ValueError("Captured inference shard layouts differ across engines")
         logger.info(
             f"Start to get training parameters meta from meta server for engine rank {self.engine_rank}"
         )
@@ -192,7 +204,8 @@ class WeightsReader(WeightExchangeReader):
         check_train_infer_params_meta(
             self.training_params_meta,
             self.parameters_meta,
-            raise_exception=not config.enable_debug_mode,
+            raise_exception=self.infer_conf.get("loader_capture", False)
+            or not config.enable_debug_mode,
         )
         logger.info("Start to send parameters meta to tp workers")
         infer_parameters_meta_bytes = pickle.dumps(self.parameters_meta)
@@ -567,13 +580,18 @@ class WorkerWeightsReader:
         )
         self.meta_server_addr = meta_server_addr
         self.meta_server_client = MetaServerClient(*self.meta_server_addr.split(":"))
-        self.weight_converter = get_infer_weights_converter(
-            self.engine_name,
-            self.model_arch_name,
-            hf_config=self.model.config,
-            infer_engine_config=self.infer_engine_config,
-            rank_info=self.rank_info,
-        )
+        self.load_plan = getattr(model, CAPTURE_ATTRIBUTE, None)
+        if (self.load_plan is not None) != infer_conf.get("loader_capture", False):
+            raise ValueError("Worker loader capture mode disagrees with inference metadata")
+        self.weight_converter = None
+        if self.load_plan is None:
+            self.weight_converter = get_infer_weights_converter(
+                self.engine_name,
+                self.model_arch_name,
+                hf_config=self.model.config,
+                infer_engine_config=self.infer_engine_config,
+                rank_info=self.rank_info,
+            )
         self.current_worker_parameters_meta = [
             p.to_local_parameter_meta(self.rank_info.global_rank)
             for p in self.parameters_meta
@@ -605,11 +623,14 @@ class WorkerWeightsReader:
         )
 
     def initialize(self):
-        self.parameters = {
-            hf_name: hf_param
-            for (name, param) in self.model.named_parameters()
-            for (hf_name, hf_param) in self.weight_converter.convert_param(name, param)
-        }
+        if self.load_plan is not None:
+            self.parameters = self.load_plan.bind(self.model)
+        else:
+            self.parameters = {
+                hf_name: hf_param
+                for (name, param) in self.model.named_parameters()
+                for (hf_name, hf_param) in self.weight_converter.convert_param(name, param)
+            }
         if (
             getattr(self.hf_config, "tie_word_embeddings", False)
             and self.rank_info.pp_rank == self.rank_info.pp_size - 1

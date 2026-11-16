@@ -16,8 +16,10 @@ def _is_model_registry_process():
 def register_shardfly_plugin():
     if _is_model_registry_process():
         return
+    from shardfly.integrations.vllm.loader import register_capture_loader
     from shardfly.integrations.vllm.plugin import (
         register_shardfly_plugin as register,
     )
 
+    register_capture_loader()
     register()

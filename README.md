@@ -109,6 +109,31 @@ Model converters live in `python/shardfly/integrations/models/`. Workers are
 patched by `python/shardfly/integrations/vllm/plugin.py`, including spawned DP
 workers through `worker_extension.py`.
 
+### Capture receive layouts at checkpoint load
+
+With a vLLM version that exposes `register_model_loader` and
+`DefaultModelLoader.get_all_weights` (for example v0.21.0), start the serving
+worker with the ShardFly plugin enabled:
+
+```sh
+vllm serve /path/to/checkpoint --load-format shardfly_capture
+```
+
+During the normal checkpoint load, each worker records which checkpoint
+slice populates each native parameter region. The usual `/shardfly_init` and
+`/shardfly_update` flow uses those slices to build the transfer plan and bind
+receive buffers to the live parameters. This removes the need for a
+model-specific vLLM converter or sharding rule for supported loaders. Training
+still supplies checkpoint-named tensors and sharding metadata through its
+existing exporter.
+
+Capture supports unquantized eager loaders that copy rectangular checkpoint
+slices into contiguous native regions, including fused projections and
+zero-padded vocabularies. Each checkpoint tensor contributes at most one slice
+per rank, and the slices must cover a single-axis partition or a replicated full
+tensor. Unsupported transforms, overlapping writes and changes to the native
+parameter layout fail with the affected parameter or operation in the error.
+
 ## veRL adapter
 
 `python/shardfly/integrations/verl/` provides a checkpoint-engine adapter and

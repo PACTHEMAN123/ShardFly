@@ -173,7 +173,8 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         check_train_infer_params_meta(
             self.parameters_meta,
             self.infer_params_meta,
-            raise_exception=not self.enable_debug_mode,
+            raise_exception=self.infer_conf.get("loader_capture", False)
+            or not self.enable_debug_mode,
         )
         self.weight_converter = get_train_weights_converter(
             self.train_engine.engine_name,
