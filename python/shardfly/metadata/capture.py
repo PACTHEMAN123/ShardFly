@@ -10,8 +10,8 @@ from shardfly.metadata.parameter import (
     ParameterMeta,
     ParameterReplicaMeta,
     ParameterShardMeta,
+    ShardingType,
 )
-from shardfly.metadata.sharding import ShardingType
 
 
 def _validate_tiling(name, geometry, global_shape):

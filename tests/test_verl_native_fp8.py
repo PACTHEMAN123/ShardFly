@@ -3,7 +3,8 @@ import sys
 from types import SimpleNamespace
 
 import torch
-from shardfly.integrations.publication.verl_native import _load_fp8_weights
+
+from shardfly.integrations.publication import _load_fp8_weights
 
 
 def test_fp8_native_loader_consumes_views_before_bucket_reuse(monkeypatch):
@@ -59,6 +60,7 @@ def test_fp8_native_loader_consumes_views_before_bucket_reuse(monkeypatch):
 
 def test_native_fp8_oracle_accepts_only_adjacent_midpoint_roundings(monkeypatch):
     import pytest
+
     from shardfly.profiling.fp8_model import FP8ModelWeightProfile
     from shardfly.profiling.model import version_marker_factor
 

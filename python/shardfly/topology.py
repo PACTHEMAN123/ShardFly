@@ -16,10 +16,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
+from collections.abc import MutableMapping
 from dataclasses import dataclass
+from pathlib import Path
 
 
 class TransportUnavailableError(RuntimeError):
@@ -365,3 +368,89 @@ def _resolve_gin_reliable_doorbell(gin_reliable_doorbell: int | None) -> int:
             "transport GIN reliable doorbell mode must be in [0, 2]"
         )
     return gin_reliable_doorbell
+
+
+def configure_ray_locality(
+    env: MutableMapping[str, str] | None = None,
+    *,
+    worker_local_rank: int | None = None,
+) -> None:
+    """Map a single-GPU Ray actor back to its node-local physical GPU rank."""
+
+    env = os.environ if env is None else env
+    policy = env.get("SHARDFLY_HCA_POLICY", "balanced")
+    if policy.strip().lower() != "balanced":
+        return
+    if worker_local_rank is not None:
+        try:
+            env["LOCAL_RANK"] = str(int(worker_local_rank))
+        except (TypeError, ValueError):
+            return
+    if "SHARDFLY_NODE_LOCAL_RANK_OFFSET" in env:
+        return
+
+    visible_devices = [
+        device.strip()
+        for device in env.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if device.strip()
+    ]
+    if not visible_devices or not all(device.isdigit() for device in visible_devices):
+        return
+
+    local_world_size = env.get("RAY_LOCAL_WORLD_SIZE") or env.get("LOCAL_WORLD_SIZE")
+    try:
+        if worker_local_rank is None:
+            if len(visible_devices) != 1:
+                return
+            physical_rank = int(visible_devices[0])
+        else:
+            worker_local_rank = int(worker_local_rank)
+            if not 0 <= worker_local_rank < len(visible_devices):
+                return
+            physical_rank = int(visible_devices[worker_local_rank])
+        local_rank = int(env.get("LOCAL_RANK", "0"))
+        world_size = int(local_world_size or "")
+    except (TypeError, ValueError):
+        return
+    if world_size <= 1 or not 0 <= physical_rank < world_size:
+        return
+
+    env["SHARDFLY_NODE_LOCAL_RANK_OFFSET"] = str(physical_rank - local_rank)
+    env["SHARDFLY_NODE_LOCAL_WORLD_SIZE"] = str(world_size)
+
+
+def configure_rank_affinity(local_rank, *, physical_gpu=None):
+    configured = os.environ.get("SHARDFLY_RANK_AFFINITY")
+    if not configured:
+        return
+    if physical_gpu is None:
+        devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+        physical_gpu = devices[int(local_rank)]
+    physical_gpu = str(physical_gpu)
+    entry = json.loads(configured)[physical_gpu]
+    # Bind every existing thread, including pools created while importing
+    # torch. New threads inherit the affinity; model allocations follow the
+    # local CPU domain's first-touch policy. This does not force membind.
+    cpus = set(entry["cpus"])
+    for thread in Path("/proc/self/task").iterdir():
+        try:
+            os.sched_setaffinity(int(thread.name), cpus)
+        except ProcessLookupError:
+            pass
+    hca = entry["hca"]
+    os.environ["NCCL_IB_HCA"] = hca
+    os.environ["SHARDFLY_HCA_POLICY"] = "topology"
+    print(
+        "SHARDFLY_RANK_AFFINITY "
+        + json.dumps(
+            {
+                "pid": os.getpid(),
+                "physical_gpu": physical_gpu,
+                "hca": hca,
+                "numa": entry["numa"],
+                "cpus": sorted(os.sched_getaffinity(0)),
+                "before_nccl_init": True,
+            }
+        ),
+        flush=True,
+    )

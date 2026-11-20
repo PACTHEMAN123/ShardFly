@@ -105,6 +105,11 @@ server started with the package on `PYTHONPATH` exposes the publication API:
 - `POST /publication_init`, `/publication_update`, `/publication_close`
 - `GET /publication_telemetry`
 
+The optional standalone server entrypoint is
+`python -m shardfly.integrations.vllm`. For explicit worker-extension
+configuration, use `shardfly.integrations.vllm.ShardFlyWorkerExtension`. The veRL
+checkpoint-engine registration module is `shardfly.integrations.verl`.
+
 ### Capture training and inference layouts
 
 Start each serving worker with the ShardFly plugin and a vLLM version that

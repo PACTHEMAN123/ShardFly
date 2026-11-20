@@ -1,12 +1,39 @@
-"""Read cumulative RDMA port counters without entering CUDA or transport code."""
+"""Emit publication timings and read host RDMA counters."""
 
-import os
+import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+import os
 import socket
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+
+def profile_enabled() -> bool:
+    return os.environ.get("SHARDFLY_PROFILE", "0").lower() in {"1", "true", "yes"}
+
+
+def profile_phase(step_id: int) -> str:
+    warmup_updates = int(os.environ.get("SHARDFLY_PROFILE_WARMUP_UPDATES", "0"))
+    update_index = int(step_id) + 1
+    return "warmup" if update_index < warmup_updates else "measure"
+
+
+def emit_profile(logger, **values: Any) -> None:
+    if not profile_enabled():
+        return
+    record = (
+        "SHARDFLY_PROFILE "
+        + json.dumps(values, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode()
+    try:
+        # One write keeps records intact when torchrun ranks share stdout.
+        os.write(1, record)
+    except OSError:
+        logger.info("%s", record.decode().rstrip())
 
 
 def _rdma_stats(netdev):

@@ -3,11 +3,17 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from shardfly.integrations.loader_capture import CAPTURE_ATTRIBUTE, WeightLoadCapture
-from shardfly.integrations.metadata.inference import InferParamMetaResolver
-from shardfly.integrations.reader.base import WorkerWeightsReader
-from shardfly.integrations.sharding.vllm import get_vllm_rank_info
-from shardfly.integrations.vllm.loader import register_capture_loader
+
+from shardfly.integrations.loader_capture import (
+    CAPTURE_ATTRIBUTE,
+    WeightLoadCapture,
+    register_capture_loader,
+)
+from shardfly.integrations.reader import (
+    InferParamMetaResolver,
+    WorkerWeightsReader,
+    get_vllm_rank_info,
+)
 from shardfly.metadata.capture import build_captured_parameters_meta
 from shardfly.plan import TransferPlanBuilder
 
@@ -80,7 +86,7 @@ def _capture(model, weights):
 
 def test_loader_capture_reuses_transfer_plan_for_changed_weights(monkeypatch):
     monkeypatch.setattr(
-        "shardfly.integrations.reader.base.MetaServerClient", lambda *args: None
+        "shardfly.integrations.reader.MetaServerClient", lambda *args: None
     )
     weights = _weights()
     models = [_FusedModel(rank) for rank in range(2)]

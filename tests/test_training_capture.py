@@ -4,15 +4,16 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from shardfly.capture import capture_training
-from shardfly.integrations.loader_capture import WeightLoadCapture
-from shardfly.integrations.sharding.vllm import get_vllm_rank_info
-from shardfly.integrations.writer import base as writer_module
-from shardfly.metadata.capture import build_captured_parameters_meta
-from shardfly.plan import TransferPlanBuilder
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel, fully_shard
 from torch.distributed.tensor import Shard, distribute_tensor
+
+from shardfly.capture import capture_training
+from shardfly.integrations import engine as writer_module
+from shardfly.integrations.loader_capture import WeightLoadCapture
+from shardfly.integrations.reader import get_vllm_rank_info
+from shardfly.metadata.capture import build_captured_parameters_meta
+from shardfly.plan import TransferPlanBuilder
 
 
 def _inference_layout(checkpoint):
@@ -180,7 +181,6 @@ def test_training_engine_publishes_fresh_weights_through_the_same_prepared_bindi
     monkeypatch,
 ):
     from shardfly.integrations.engine import CapturedTrainingEngine
-    from shardfly.integrations.writer import worker as transport_module
 
     model = torch.nn.Linear(4, 5, bias=False)
     infer_meta, targets = _inference_layout(model.weight.detach())
@@ -203,8 +203,8 @@ def test_training_engine_publishes_fresh_weights_through_the_same_prepared_bindi
     )
     monkeypatch.setattr(dist, "broadcast_object_list", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dist, "barrier", lambda **_: None)
-    monkeypatch.setattr(transport_module.device_util, "synchronize", lambda **_: None)
-    monkeypatch.setattr(transport_module.device_util, "current_device", lambda: 0)
+    monkeypatch.setattr(writer_module.device_util, "synchronize", lambda **_: None)
+    monkeypatch.setattr(writer_module.device_util, "current_device", lambda: 0)
     prepared = []
 
     class CPUTransport:
@@ -226,7 +226,7 @@ def test_training_engine_publishes_fresh_weights_through_the_same_prepared_bindi
                     )
             return {}
 
-    monkeypatch.setattr(transport_module, "Transport", CPUTransport)
+    monkeypatch.setattr(writer_module, "Transport", CPUTransport)
     engine = CapturedTrainingEngine(
         capture_training(model), meta_server_addr="test:1234"
     )

@@ -16,6 +16,7 @@
 # Copyright the Awex developers, licensed under the Apache License, Version 2.0.
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import List, Tuple
 
 import torch
@@ -23,11 +24,67 @@ import torch
 from shardfly import logging
 from shardfly._utils.common import to_dict
 from shardfly.capture import TensorKey
-from shardfly.metadata.sharding import (
-    ShardingType,
-)
 
 logger = logging.getLogger(__name__)
+
+
+class ShardingType(Enum):
+    """
+    Enum representing the type of sharding applied to a parameter.
+    """
+
+    NO_SHARDING = "NO_SHARDING"
+    TP_SHARDING = "TP_SHARDING"
+    DP_TP_SHARDING = "DP_TP_SHARDING"
+    EP_SHARDING = "EP_SHARDING"
+    EP_TP_SHARDING = "EP_TP_SHARDING"
+
+
+@dataclass(slots=True)
+class RankInfo:
+    """
+    Holds information about the distributed training ranks and sizes for a model worker.
+
+    Attributes:
+        tp_rank (int): Tensor parallel rank.
+        tp_size (int): Tensor parallel size.
+        pp_rank (int): Pipeline parallel rank.
+        pp_size (int): Pipeline parallel size.
+        dp_size (int): Data parallel size.
+        attn_tp_rank (int): Attention tensor parallel rank.
+        attn_tp_size (int): Attention tensor parallel size.
+        attn_dp_rank (int): Attention data parallel rank.
+        world_size (int): Total world size.
+        global_rank (int): Global rank of the worker.
+        local_rank (int): Local rank of the worker.
+        engine_rank (int): Engine rank of the worker.
+        is_infer (bool): Whether the worker is an inference worker.
+        cp_rank (int): Context parallel rank.
+        cp_size (int): Context parallel world size.
+        cp_mode (str): Context parallel mode label (e.g. none/ring/ulysses).
+    """
+
+    tp_rank: int
+    tp_size: int
+    pp_rank: int
+    pp_size: int
+    dp_size: int
+    dp_rank: int
+    ep_rank: int
+    ep_size: int
+    ep_tp_rank: int
+    ep_tp_size: int
+    attn_tp_rank: int
+    attn_tp_size: int
+    attn_dp_rank: int
+    world_size: int
+    global_rank: int
+    local_rank: int
+    engine_rank: int
+    is_infer: bool
+    cp_rank: int = 0
+    cp_size: int = 1
+    cp_mode: str = "none"
 
 
 @dataclass(slots=True)

@@ -2,7 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from shardfly.integrations.publication.verl_native import (
+
+from shardfly.integrations.publication import (
     NativePublication,
     NativeReceiver,
 )

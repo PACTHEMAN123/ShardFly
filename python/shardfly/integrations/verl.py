@@ -24,14 +24,14 @@ from typing import Any
 import ray
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
 
-from shardfly.integrations.config import InferenceConfig
-from shardfly.integrations.verl.environment import configure_ray_locality
+from shardfly.integrations.vllm import InferenceConfig
+from shardfly.topology import configure_ray_locality
 
 configure_ray_locality()
 from shardfly.capture import capture_training
 from shardfly.control.store import start_meta_server
 from shardfly.integrations.engine import CapturedTrainingEngine
-from shardfly.integrations.reader.base import get_weights_exchange_reader
+from shardfly.integrations.reader import WeightsReader
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ class _VerlVLLMInferenceEngine:
         return self._config.engine_rank
 
     def initialize(self) -> None:
-        self.weights_exchange_reader = get_weights_exchange_reader(self)
+        self.weights_exchange_reader = WeightsReader(self)
         self.weights_exchange_reader.initialize()
 
     def update_weights(self, step_id: int) -> None:
