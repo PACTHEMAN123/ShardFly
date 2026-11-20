@@ -9,11 +9,9 @@ reference before using their FP32 rounding to define the byte oracle.
 import json
 from contextlib import ExitStack
 from pathlib import Path
-from types import SimpleNamespace
 
 import torch
 
-from shardfly.integrations.conversion.base import normalize_scale_inv_name
 from shardfly.profiling.model import ModelWeightProfile, version_marker_factor
 
 
@@ -70,77 +68,6 @@ class FP8ModelWeightProfile(ModelWeightProfile):
         self.pointers = {name: p.data_ptr() for name, p in self.parameters.items()}
 
     @classmethod
-    def from_vllm_checkpoint(cls, model, context, checkpoint, marker_mode, marker_period):
-        """Build a checkpoint oracle without a ShardFly reader or transport.
-
-        Supports Qwen3-MoE TP1/2 with EP1/8. Expert names identify HF tensors;
-        TP-sharded experts and dense parameters use native vLLM shard offsets.
-        """
-        from safetensors import safe_open
-        from shardfly.integrations.models.registry import get_infer_weights_converter
-        from shardfly.integrations.sharding.vllm import (
-            get_vllm_rank_info, get_vllm_sharding_strategy,
-        )
-        from shardfly.metadata.sharding import ShardingType
-
-        config = context["infer_engine_config"]
-        rank = get_vllm_rank_info(context, 0)
-        architecture = model.config.architectures[0]
-        if architecture != "Qwen3MoeForCausalLM" or rank.tp_size not in (1, 2) or rank.ep_size not in (1, 8):
-            raise ValueError("Native FP8 checkpoint oracle requires Qwen3-MoE TP1/2 EP1/8")
-        converter = get_infer_weights_converter(
-            "vllm", architecture, hf_config=model.config,
-            infer_engine_config=config, rank_info=rank,
-        )
-        strategy = get_vllm_sharding_strategy(
-            architecture, config, rank, hf_config=model.config)
-        parameters = {key: value for name, parameter in model.named_parameters()
-                      for key, value in converter.convert_param(name, parameter)}
-        checkpoint = Path(checkpoint)
-        index = json.loads((checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
-        metadata = []
-        with ExitStack() as stack:
-            files = {}
-            for key, actual in parameters.items():
-                name, is_scale = normalize_scale_inv_name(key)
-                offsets = [0] * actual.ndim
-                if not is_scale:
-                    filename = index[name]
-                    if filename not in files:
-                        files[filename] = stack.enter_context(safe_open(
-                            checkpoint / filename, framework="pt", device="cpu"))
-                    shape = tuple(files[filename].get_slice(name).get_shape())
-                    if tuple(actual.shape) != shape:
-                        kind, dim, count = strategy.get_sharding_strategy(name, rank_info=rank)
-                        if kind == ShardingType.TP_SHARDING:
-                            physical, world = rank.tp_rank, rank.tp_size
-                        elif kind == ShardingType.DP_TP_SHARDING:
-                            physical, world = rank.attn_tp_rank, rank.attn_tp_size
-                        else:
-                            raise ValueError(f"Unsupported native FP8 checkpoint shard: {key}")
-                        offsets[dim] = (physical // (world // count)) * actual.shape[dim]
-                        if any(actual.shape[d] != shape[d] for d in range(actual.ndim) if d != dim):
-                            raise ValueError(f"Native FP8 checkpoint shard shape mismatch: {key}")
-                metadata.append(SimpleNamespace(name=key, shards=[SimpleNamespace(
-                    shape=tuple(actual.shape), global_offset=tuple(offsets))]))
-        profile = cls.from_checkpoint(SimpleNamespace(
-            parameters=parameters, current_worker_parameters_meta=metadata,
-        ), checkpoint, marker_mode, marker_period)
-        profile.native_model = model
-        # veRL's Triton FP32 reciprocal can land on the other side of an FP8
-        # midpoint from the independently rounded reciprocal used by GIN.
-        profile.quantization_rounding = "fp32_interval"
-        profile.native_pointers = {name: p.data_ptr() for name, p in model.named_parameters()}
-        return profile
-
-    def command(self, operation, version):
-        if hasattr(self, "native_model") and self.native_pointers != {
-            name: p.data_ptr() for name, p in self.native_model.named_parameters()
-        }:
-            raise AssertionError("A native FP8 model parameter was replaced")
-        return super().command(operation, version)
-
-    @classmethod
     def from_checkpoint(cls, reader, checkpoint, marker_mode, marker_period):
         from safetensors import safe_open
 
@@ -154,8 +81,8 @@ class FP8ModelWeightProfile(ModelWeightProfile):
         with ExitStack() as stack:
             files = {}
             for key, meta in metadata.items():
-                name, is_scale = normalize_scale_inv_name(key)
-                if is_scale:
+                name = key
+                if name.endswith("_scale_inv"):
                     continue
                 if len(meta.shards) != 1:
                     raise ValueError(f"Expected one canonical shard: {key}")
@@ -166,18 +93,13 @@ class FP8ModelWeightProfile(ModelWeightProfile):
                         checkpoint / filename, framework="pt", device="cpu"))
                 data = files[filename].get_slice(name)
                 shape = data.get_shape()
-                offsets = shard.global_offset or (0,) * len(shape)
-                slices = tuple(slice(offset, min(offset + size, limit))
-                               for offset, size, limit in zip(offsets, shard.shape, shape))
+                slices = tuple(slice(offset, offset + size)
+                               for offset, size in zip(shard.global_offset, shard.shape))
                 actual = parameters[key]
                 dtype = torch.bfloat16 if actual.dtype == torch.float8_e4m3fn else actual.dtype
                 loaded = data[slices].to(device=actual.device, dtype=dtype)
-                if tuple(loaded.shape) != tuple(shard.shape):
-                    if name not in ("model.embed_tokens.weight", "lm_head.weight"):
-                        raise ValueError(f"Unexpected checkpoint padding: {name}")
-                    expected = torch.zeros(tuple(shard.shape), device=actual.device, dtype=dtype)
-                    expected[tuple(slice(0, size) for size in loaded.shape)].copy_(loaded)
-                    loaded = expected
+                if tuple(loaded.shape) != tuple(shard.shape) or len(shape) != len(shard.shape):
+                    raise ValueError(f"Checkpoint does not cover the recorded shard: {name}")
                 references[key] = loaded
         profile = cls(parameters, references, marker_mode, marker_period)
         torch.cuda.synchronize()

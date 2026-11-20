@@ -22,6 +22,7 @@ import torch
 
 from shardfly import logging
 from shardfly._utils.common import to_dict
+from shardfly.capture import TensorKey
 from shardfly.metadata.sharding import (
     ShardingType,
 )
@@ -69,6 +70,11 @@ class ParameterShardMeta:
     cp_mode: str = "none"
     dp_rank: int = 0
     dp_size: int = 1
+    binding_key: TensorKey | None = None
+
+    @property
+    def tensor_key(self) -> TensorKey:
+        return self.binding_key if self.binding_key is not None else self.name
 
 
 @dataclass(slots=True)
@@ -132,6 +138,7 @@ class ParameterMeta:
                     sharding_type=shard.sharding_type,
                     num_shards=shard.num_shards,
                     sharding_dim=shard.sharding_dim,
+                    binding_key=shard.binding_key,
                 )
                 replica_shards.append(new_shard)
             shards.extend(replica_shards)
@@ -153,30 +160,11 @@ class ParameterMeta:
         ]
         new_meta.shards = shards
 
-        # Filter replicas to only include those that have shards for this global_rank
-        filtered_replicas = []
         for replica in new_meta.replicas:
-            replica_shards = [
+            replica.shards = [
                 shard for shard in replica.shards if shard.global_rank == global_rank
             ]
-            if len(replica_shards) == 1:
-                # This replica has exactly one shard for this rank, keep it
-                replica.shards = replica_shards
-                filtered_replicas.append(replica)
-            else:
-                assert len(replica_shards) == 0, (
-                    f"A tp worker should have at most one shard per replica but got {len(replica_shards)} shards for {global_rank}"
-                )
-
-        new_meta.replicas = filtered_replicas
-
-        # for mode expert parameters, it won't exist on all ranks
-        assert len(shards) <= 1, (
-            f"A tp worker should have one shard for model parameter but got {shards} for {global_rank}"
-        )
-        assert len(filtered_replicas) <= 1, (
-            f"No replicas found for global_rank {global_rank}"
-        )
+        new_meta.replicas = [replica for replica in new_meta.replicas if replica.shards]
 
         return new_meta
 

@@ -21,16 +21,14 @@ import pickle
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from shardfly import logging
 from shardfly._utils import device as device_util
 from shardfly._utils.common import (
-    check_train_infer_params_meta,
     compute_statistics,
-    simple_hf_config,
     stripped_env_vars,
 )
 from shardfly._utils.profile import emit_profile, profile_phase
@@ -38,29 +36,14 @@ from shardfly._utils.tensor import (
     check_and_log_nan_values,
     compare_and_log_tensor_differences,
 )
+from shardfly.capture import capture_inference
 from shardfly.control.store import MetaServerClient
-from shardfly.integrations.loader_capture import CAPTURE_ATTRIBUTE
 from shardfly.integrations.metadata.inference import InferParamMetaResolver
-from shardfly.integrations.models.registry import get_infer_weights_converter
-from shardfly.integrations.sharding import get_rank_info_extractor
-from shardfly.metadata.resolver import ParameterMeta
+from shardfly.integrations.sharding.vllm import get_vllm_rank_info
+from shardfly.metadata.capture import validate_captured_weights
+from shardfly.metadata.parameter import ParameterMeta
 
 logger = logging.getLogger(__name__)
-
-
-def derive_expected_pp_ranks(
-    infer_params_meta: Sequence[ParameterMeta], local_engine_rank: int
-) -> List[int]:
-    pp_ranks = set()
-    for param in infer_params_meta:
-        for shard in param.shards:
-            if shard.engine_rank == local_engine_rank:
-                pp_ranks.add(shard.pp_rank)
-    if not pp_ranks:
-        raise ValueError(
-            f"No infer shards found for engine_rank={local_engine_rank}; cannot derive expected_pp_ranks"
-        )
-    return sorted(pp_ranks)
 
 
 class WeightExchangeReader(ABC):
@@ -90,27 +73,19 @@ class WeightsReader(WeightExchangeReader):
         if meta_resolver is None:
             meta_resolver = InferParamMetaResolver(
                 inference_engine,
-                num_engines=inference_engine.num_engines,
                 engine_rank=inference_engine.engine_rank,
-                convert_params=True,
             )
         self.meta_resolver = meta_resolver
         self.parameters_meta = []
-        self.hf_config = inference_engine.hf_config
         config = inference_engine.config
-        self.model_arch_name = meta_resolver.get_model_arch_name()
         self.meta_server_addr = config.meta_server_addr
         logger.info(f"Meta server address: {self.meta_server_addr}")
         self.meta_server_client = MetaServerClient(*self.meta_server_addr.split(":"))
         self.num_engines = config.num_engines
         logger.info("Put number of inference engines to meta server")
         self.engine_rank = self.inference_engine.engine_rank
-        self.tp_size = config.tp_size
-        self.pp_size = config.pp_size
-        self.dp_size = max(1, int(getattr(config, "dp_size", 1) or 1))
-        self.infer_world_size = (
-            self.num_engines * self.tp_size * self.pp_size * self.dp_size
-        )
+        self.infer_instance_world_size = meta_resolver.get_parameters_meta()[0].shards[0].world_size
+        self.infer_world_size = self.num_engines * self.infer_instance_world_size
         self.validated_steps = 0
         self.start_step = -1
         self.weights_validation_steps = config.weights_validation_steps
@@ -126,10 +101,6 @@ class WeightsReader(WeightExchangeReader):
         self.timeout = 10000
         self.lock = threading.Lock()
         self.initialized = False
-        self.expected_pp_ranks: List[int] = []
-        logger.info(
-            f"DP rank id: {self.engine_rank}, num_engines: {self.num_engines}, engine_rank: {self.engine_rank}, infer_world_size: {self.infer_world_size}, tp={self.tp_size}, pp={self.pp_size}, dp={self.dp_size}"
-        )
 
     def initialize(self, **kwargs):
         self.meta_server_client.put_object("num_infer_engines", self.num_engines)
@@ -145,45 +116,12 @@ class WeightsReader(WeightExchangeReader):
         logger.info(
             "Finished querying and building parameters meta from all tp workers"
         )
-        self.expected_pp_ranks = derive_expected_pp_ranks(
-            self.parameters_meta, self.engine_rank
-        )
-        logger.info(
-            "Derived expected_pp_ranks for engine %s: %s",
-            self.engine_rank,
-            self.expected_pp_ranks,
-        )
-        self.infer_conf = {
-            "engine_name": self.inference_engine.engine_name,
-            "infer_atten_tp_size": self.meta_resolver.rank0_info.attn_tp_size,
-            "router_dtype": getattr(self.hf_config, "router_dtype", "bf16"),
-            "infer_engine_config": self.infer_engine_config,
-            "hf_config": simple_hf_config(self.hf_config),
-            "infer_world_size": self.infer_world_size,
-            "expected_pp_ranks": self.expected_pp_ranks,
-            "device_backend": device_util.get_device_type(),
-        }
-        if getattr(self.meta_resolver, "uses_loader_capture", False):
-            self.infer_conf["loader_capture"] = True
-        if self.model_arch_name == "Glm4MoeLiteForCausalLM":
-            # The draft may share embedding/head storage with the main model.
-            # Publish only distinct targets discovered from its actual weights.
-            self.infer_conf["mtp_alias_targets"] = [
-                parameter.name
-                for parameter in self.parameters_meta
-                if parameter.name.startswith("model.layers.")
-                and parameter.name.endswith(
-                    ("embed_tokens.weight", "shared_head.head.weight")
-                )
-            ]
-        self.meta_server_client.put_object("infer_conf", self.infer_conf)
-        logger.info(f"Put inference config {self.infer_conf} to meta server")
         if self.engine_rank == 0:
             self.meta_server_client.put_object(
                 "infer_params_meta", self.parameters_meta
             )
             logger.info("Put inference parameters meta to meta server")
-        elif self.infer_conf.get("loader_capture", False):
+        else:
             reference = self.meta_server_client.get_object(
                 "infer_params_meta", timeout=self.timeout
             )
@@ -201,19 +139,12 @@ class WeightsReader(WeightExchangeReader):
         logger.info("Finished getting training parameters meta from meta server")
         self.training_world_size = self.training_params_meta[0].shards[0].world_size
         config = self.inference_engine.config
-        check_train_infer_params_meta(
-            self.training_params_meta,
-            self.parameters_meta,
-            raise_exception=self.infer_conf.get("loader_capture", False)
-            or not config.enable_debug_mode,
-        )
+        validate_captured_weights(self.training_params_meta, self.parameters_meta)
         logger.info("Start to send parameters meta to tp workers")
         infer_parameters_meta_bytes = pickle.dumps(self.parameters_meta)
         train_parameters_meta_bytes = pickle.dumps(self.training_params_meta)
-        infer_conf_bytes = pickle.dumps(self.infer_conf)
         self._preparation_results = self.inference_engine.execute_task_in_model_worker(
             self._init_in_tp_worker,
-            infer_conf_bytes=infer_conf_bytes,
             parameters_meta_bytes=infer_parameters_meta_bytes,
             training_params_meta_bytes=train_parameters_meta_bytes,
             engine_rank=self.engine_rank,
@@ -232,7 +163,6 @@ class WeightsReader(WeightExchangeReader):
 
     @staticmethod
     def _init_in_tp_worker(
-        infer_conf_bytes: bytes,
         parameters_meta_bytes: bytes,
         training_params_meta_bytes: bytes,
         engine_rank: int,
@@ -247,7 +177,6 @@ class WeightsReader(WeightExchangeReader):
         model = kwargs["model"]
         model_context = kwargs["model_context"]
         scheduler = model_context["scheduler"]
-        infer_conf = pickle.loads(infer_conf_bytes)
         parameters_meta = pickle.loads(parameters_meta_bytes)
         training_params_meta = pickle.loads(training_params_meta_bytes)
         infer_engine_config = model_context.get("infer_engine_config")
@@ -260,10 +189,8 @@ class WeightsReader(WeightExchangeReader):
 
         cls = TransportWorkerReader
         scheduler.shardfly_weights_reader = cls(
-            engine_name=infer_conf.get("engine_name", "vllm"),
             model=model,
             model_context=model_context,
-            infer_conf=infer_conf,
             engine_rank=engine_rank,
             num_engines=num_engines,
             meta_server_addr=meta_server_addr,
@@ -299,7 +226,7 @@ class WeightsReader(WeightExchangeReader):
                 raise ValueError("Model readers require a changed surviving cohort")
             self.num_engines = engines
             self.infer_engine_config.num_engines = engines
-            self.infer_world_size = engines * self.tp_size * self.pp_size * self.dp_size
+            self.infer_world_size = engines * self.infer_instance_world_size
             if not self.initialized:
                 self._pending_membership = specification
                 self._initialize()
@@ -387,14 +314,14 @@ class WeightsReader(WeightExchangeReader):
         scheduler._asystem_copied_parameters = {}
         for name, param in model.named_parameters():
             scheduler._asystem_copied_parameters[name] = (
-                param.detach().cpu().contiguous()
+                param.detach().to(device="cpu", copy=True).contiguous()
             )
         logger.info(
             f"Finished copying parameters for step {step_id} for consistency check"
         )
-        for name, param in model.named_parameters():
-            param.data.fill_(0)
-            logger.debug(f"Set parameter {name} to 0")
+        with torch.inference_mode():
+            for tensor in scheduler.shardfly_weights_reader.parameters.values():
+                tensor.zero_()
         device_util.synchronize()
 
     def _validate_weights(
@@ -531,10 +458,8 @@ class WeightsReader(WeightExchangeReader):
 class WorkerWeightsReader:
     def __init__(
         self,
-        engine_name,
         model,
         model_context,
-        infer_conf,
         engine_rank,
         num_engines,
         meta_server_addr: str,
@@ -545,12 +470,8 @@ class WorkerWeightsReader:
         disable_pipeline: bool = False,
         weights_comm_nccl_group_size: int = None,
     ):
-        self.engine_name = engine_name
         self.model = model
         self.model_context = model_context
-        self.infer_conf = infer_conf
-        self.hf_config = infer_conf["hf_config"]
-        self.model_arch_name = self.hf_config.architectures[0]
         self.scheduler = model_context["scheduler"]
         self.infer_engine_config = model_context["infer_engine_config"]
         self.comm_backend = getattr(self.infer_engine_config, "comm_backend", "nccl")
@@ -570,9 +491,7 @@ class WorkerWeightsReader:
         self.infer_instance_world_size = parameters_meta[0].shards[0].world_size
         self.infer_world_size = num_engines * self.infer_instance_world_size
         self.transfer_world_size = self.training_world_size + self.infer_world_size
-        self.rank_info = get_rank_info_extractor(engine_name)(
-            model_context, engine_rank
-        )
+        self.rank_info = get_vllm_rank_info(model_context, engine_rank)
         logger.info(f"Reader rank info: {self.rank_info}")
         self.transfer_rank = (
             +self.engine_rank * self.infer_instance_world_size
@@ -580,18 +499,7 @@ class WorkerWeightsReader:
         )
         self.meta_server_addr = meta_server_addr
         self.meta_server_client = MetaServerClient(*self.meta_server_addr.split(":"))
-        self.load_plan = getattr(model, CAPTURE_ATTRIBUTE, None)
-        if (self.load_plan is not None) != infer_conf.get("loader_capture", False):
-            raise ValueError("Worker loader capture mode disagrees with inference metadata")
-        self.weight_converter = None
-        if self.load_plan is None:
-            self.weight_converter = get_infer_weights_converter(
-                self.engine_name,
-                self.model_arch_name,
-                hf_config=self.model.config,
-                infer_engine_config=self.infer_engine_config,
-                rank_info=self.rank_info,
-            )
+        self.capture = capture_inference(model)
         self.current_worker_parameters_meta = [
             p.to_local_parameter_meta(self.rank_info.global_rank)
             for p in self.parameters_meta
@@ -623,26 +531,7 @@ class WorkerWeightsReader:
         )
 
     def initialize(self):
-        if self.load_plan is not None:
-            self.parameters = self.load_plan.bind(self.model)
-        else:
-            self.parameters = {
-                hf_name: hf_param
-                for (name, param) in self.model.named_parameters()
-                for (hf_name, hf_param) in self.weight_converter.convert_param(name, param)
-            }
-        if (
-            getattr(self.hf_config, "tie_word_embeddings", False)
-            and self.rank_info.pp_rank == self.rank_info.pp_size - 1
-            and ("lm_head.weight" not in self.parameters)
-            and ("model.embed_tokens.weight" in self.parameters)
-        ):
-            self.parameters["lm_head.weight"] = self.parameters[
-                "model.embed_tokens.weight"
-            ]
-            logger.info(
-                "WeightsReader: added lm_head.weight alias for tied embeddings."
-            )
+        self.parameters = self.capture.snapshot().tensors
 
     def update_weights(self, step_id, **kwargs):
         start_time = time.perf_counter()
@@ -653,9 +542,6 @@ class WorkerWeightsReader:
         ) * 1000.0
         update_body_start = time.perf_counter()
         self._update_weights(step_id, **kwargs)
-        post_update = getattr(self.weight_converter, "post_update", None)
-        if callable(post_update):
-            post_update(self.model)
         update_body_time_ms = (time.perf_counter() - update_body_start) * 1000.0
         logger.info(
             f"Start to flush cache for step {step_id} for rank {self.transfer_rank}"
@@ -697,29 +583,7 @@ class WorkerWeightsReader:
         )
 
     def _update_weights(self, step_id, **kwargs):
-        logger.info(
-            f"Start to update weights for step {step_id} for rank {self.engine_rank}-{self.rank_info.global_rank}"
-        )
-        tensor_pairs = []
-        for parameter_meta in self.current_worker_parameters_meta:
-            name = parameter_meta.name
-            parameter = self.parameters[name]
-            if len(parameter_meta.shards) != 1:
-                raise ValueError(f"Current shard is None for parameter: {name}")
-            tensor_pairs.append(
-                (name, parameter, parameter_meta.shards[0], parameter_meta)
-            )
-        self.read_tensors(step_id, tensor_pairs, **kwargs)
-        self.finish_step(step_id)
-        logger.info(
-            f"Finished updating weights for step {step_id} for rank {self.engine_rank}-{self.rank_info.global_rank}"
-        )
-
-    def finish_step(self, step_id):
-        pass
-
-    def read_tensors(self, step_id: int, tensor_pairs: List, **kwargs):
-        pass
+        raise NotImplementedError
 
 
 def get_weights_exchange_reader(inference_engine) -> WeightExchangeReader:

@@ -16,7 +16,6 @@
 # Copyright the Awex developers, licensed under the Apache License, Version 2.0.
 
 
-import gc
 import os
 import time
 
@@ -25,17 +24,11 @@ import torch.distributed as dist
 
 from shardfly import logging
 from shardfly._utils import device as device_util
-from shardfly._utils.common import compute_statistics
-from shardfly._utils.gpu import print_current_gpu_status
 from shardfly._utils.process_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
 )
 from shardfly._utils.profile import emit_profile, profile_phase
-from shardfly.integrations.models.device_layout import (
-    STATIC_DEVICE_LAYOUT_ARCHITECTURES,
-    annotate_device_transfer_plan,
-)
 from shardfly.integrations.writer.base import WeightsExchangeShardingWriter
 from shardfly.plan import (
     TransferPlanBuilder,
@@ -68,18 +61,10 @@ class TransportWriter(WeightsExchangeShardingWriter):
             self.training_world_size,
             self.num_infer_engines,
             self.enable_debug_mode,
+            strict_param_key_match=True,
         ).build_local_transfer_plan(
             self.infer_params_meta, self.parameters_meta, self.transfer_rank
         )
-        if self.model_arch_name in STATIC_DEVICE_LAYOUT_ARCHITECTURES:
-            annotated = annotate_device_transfer_plan(
-                self.transfer_plan, self.model_arch_name, self.hf_config
-            )
-            logger.info(
-                "Writer rank %s annotated %s source layout operations",
-                self.transfer_rank,
-                annotated,
-            )
         inter_hash = compute_transfer_plan_hash(self.transfer_plan)
         logger.info(
             "Writer rank %s inter plan hash: %s", self.transfer_rank, inter_hash
@@ -90,23 +75,16 @@ class TransportWriter(WeightsExchangeShardingWriter):
             compute_transfer_plan_stats(self.transfer_plan),
         )
         self.recv_ranks = list(self.transfer_plan.operations.keys())
-        self.required_param_names = {
-            op.send_shard_meta.name
-            for ops in self.transfer_plan.operations.values()
-            for op in ops
-        }
-        self.device_parameters = None
-        if self.model_arch_name in STATIC_DEVICE_LAYOUT_ARCHITECTURES:
-            self.device_parameters = self.compile_device_parameters(
-                self.required_param_names
-            )
+        self.required_parameters = self.required_shards(self.transfer_plan)
+        self.device_parameters = {}
+        self._prepared_parameters = None
         logger.info(
             f"Writer rank {self.transfer_rank}: Built transfer plan to send to ranks: {self.recv_ranks}"
         )
         logger.info(
-            "Writer rank %s: required converted params for this plan: %s",
+            "Writer rank %s: required captured shards for this plan: %s",
             self.transfer_rank,
-            len(self.required_param_names),
+            len(self.required_parameters),
         )
         logger.info(
             f"Writer rank {self.transfer_rank}: Operations per rank: {[(rank, len(ops)) for (rank, ops) in self.transfer_plan.operations.items()]}"
@@ -142,13 +120,21 @@ class TransportWriter(WeightsExchangeShardingWriter):
             num_infer_engines=self.num_infer_engines,
         )
         self.device_transport.resolve_rollout_topology()
-        if self.device_parameters is not None:
-            self.device_transport.prepare_send(
-                self.device_parameters, self.transfer_plan, allow_staging=False
-            )
         logger.info(
             f"Finished initializing NCCL weights writer for rank {self.transfer_rank}"
         )
+
+    @staticmethod
+    def required_shards(plan):
+        return {
+            op.send_shard_meta.tensor_key: op.send_shard_meta.name
+            for operations in plan.operations.values()
+            for op in operations
+        }
+
+    def bind_source(self, snapshot, required):
+        device = torch.device("cuda", device_util.current_device())
+        return self.bind_parameters(snapshot, required, device, self.device_parameters)
 
     def close(self) -> None:
         transport = getattr(self, "device_transport", None)
@@ -201,166 +187,45 @@ class TransportWriter(WeightsExchangeShardingWriter):
         logger.info(f"Barrier passed for weights writer with rank {self.transfer_rank}")
         self.already_initialized = True
 
-    def _destroy_weights_exchange_process_group(self):
-        pass
-
     @torch.no_grad()
     def _write_weights(self, step_id, **kwargs):
-        """
-        Asynchronously send weights to inference ranks using torch.distributed.isend.
-
-        This method implements a pipelined approach where:
-        1. For each sender rank, we maintain a queue of operations to send
-        2. We start isend operations in parallel to all sender ranks
-        3. When a send completes, we immediately start the next send to that rank
-        4. We continue until all operations to all sender ranks are completed
-
-        Args:
-            step_id: The training step ID used as communication tag
-            **kwargs: Additional keyword arguments (unused)
-        """
-        rank_coordinate = self.transfer_rank
-        logger.info(
-            f"Start to send weights using NCCL to {len(self.transfer_plan.operations)} ranks({self.recv_ranks_sample}) from rank {rank_coordinate} with {self.num_to_sends} sends"
-        )
         self._init_weights_exchange_process_group()
-        start_time = time.perf_counter()
-        parameters = None
-        parameters_are_static = False
-        p2p_op_list = None
-        using_device_transport = True
-        profile_metrics = {
-            "build_batch_time_ms": 0.0,
-            "metadata_upload_time_ms": 0.0,
-            "kernel_transfer_time_ms": 0.0,
-            "payload_bytes": 0.0,
-        }
-        convert_time_ms = 0.0
-        try:
-            if using_device_transport and self.device_parameters is not None:
-                parameters = self.device_parameters
-                parameters_are_static = True
-                logger.info(
-                    "Writer: using original parameter storage; skipping format conversion"
-                )
-            else:
-                if self.enable_mem_debug:
-                    print_current_gpu_status(
-                        f"writer-{self.transfer_rank} before convert"
-                    )
-                convert_start = time.perf_counter()
-                parameters = self.convert_parameters(
-                    required_names=self.required_param_names
-                )
-                convert_time_ms = (time.perf_counter() - convert_start) * 1000.0
-                logger.info("Writer: Converting parameters completed")
-                if self.enable_mem_debug:
-                    print_current_gpu_status(
-                        f"writer-{self.transfer_rank} after convert"
-                    )
-            logger.info("Writer: submitting device task batch")
-            sync_start_barrier_time_ms = 0.0
-            if os.environ.get("SHARDFLY_PROFILE_SYNC_START", "0") == "1":
-                sync_start = time.perf_counter()
-                dist.barrier(
-                    group=self.weights_update_group,
-                    device_ids=[device_util.current_device()],
-                )
-                sync_start_barrier_time_ms = (time.perf_counter() - sync_start) * 1000.0
-            backend_execute_start = time.perf_counter()
-            profile_metrics.update(
-                self.device_transport.send(parameters, self.transfer_plan, step_id)
+        start = time.perf_counter()
+        snapshot = self.capture_snapshot()
+        self._dump_weights(step_id, snapshot)
+        parameters = self.bind_source(snapshot, self.required_parameters)
+        if parameters is not self._prepared_parameters:
+            self.device_transport.prepare_send(
+                parameters, self.transfer_plan, allow_staging=False
             )
-            device_util.synchronize(device_id=device_util.current_device())
-            profile_metrics["backend_execute_time_ms"] = (
-                time.perf_counter() - backend_execute_start
-            ) * 1000.0
-            if self.enable_mem_debug:
-                print_current_gpu_status(f"writer-{self.transfer_rank} after send")
-            duration = time.perf_counter() - start_time
-            logger.info(
-                f"Finished sending weights for step {step_id} using NCCL to {len(self.transfer_plan.operations)} ranks({self.recv_ranks_sample}) from rank {rank_coordinate} with {self.num_to_sends} sends, took {duration:.4f} seconds"
-            )
-            compute_statistics(
-                self._history_write_weights_time,
-                step_id,
-                duration,
-                "Send weights using NCCL",
-            )
-            completion_barrier_start = time.perf_counter()
+            self._prepared_parameters = parameters
+        self.device_parameters = parameters
+        bind_time_ms = (time.perf_counter() - start) * 1000
+        if os.environ.get("SHARDFLY_PROFILE_SYNC_START", "0") == "1":
             dist.barrier(
                 group=self.weights_update_group,
                 device_ids=[device_util.current_device()],
             )
-            completion_barrier_time_ms = (
-                time.perf_counter() - completion_barrier_start
-            ) * 1000.0
-            logger.info(
-                f"Barrier passed for writer step {step_id} with rank {self.transfer_rank}"
-            )
-            kernel_transfer_time_ms = profile_metrics.get(
-                "kernel_transfer_time_ms", 0.0
-            )
-            effective_gbps = 0.0
-            if kernel_transfer_time_ms > 0:
-                effective_gbps = profile_metrics.get("payload_bytes", 0.0) / (
-                    kernel_transfer_time_ms * 1000000.0
-                )
-            backend_execute_time_ms = profile_metrics.get(
-                "backend_execute_time_ms", 0.0
-            )
-            backend_effective_gbps = 0.0
-            if backend_execute_time_ms > 0:
-                backend_effective_gbps = profile_metrics.get("payload_bytes", 0.0) / (
-                    backend_execute_time_ms * 1000000.0
-                )
-            emit_profile(
-                logger,
-                event="weight_transfer",
-                role="writer",
-                backend=self.comm_backend,
-                phase=profile_phase(step_id),
-                step_id=int(step_id),
-                rank=int(self.transfer_rank),
-                convert_time_ms=convert_time_ms,
-                sync_start_barrier_time_ms=sync_start_barrier_time_ms,
-                completion_barrier_time_ms=completion_barrier_time_ms,
-                total_transfer_time_ms=duration * 1000.0,
-                effective_gbps=effective_gbps,
-                backend_effective_gbps=backend_effective_gbps,
-                **profile_metrics,
-            )
-        finally:
-            resource_cleanup_start = time.perf_counter()
-            if p2p_op_list is not None:
-                p2p_op_list.clear()
-            if parameters is not None and (not parameters_are_static):
-                parameters.clear()
-            self._destroy_weights_exchange_process_group()
-            resource_cleanup_time_ms = (
-                time.perf_counter() - resource_cleanup_start
-            ) * 1000.0
-            should_collect_garbage = p2p_op_list is not None or (
-                parameters is not None and (not parameters_are_static)
-            )
-            gc_collect_time_ms = 0.0
-            if should_collect_garbage:
-                gc_collect_start = time.perf_counter()
-                gc.collect()
-                gc_collect_time_ms = (time.perf_counter() - gc_collect_start) * 1000.0
-            emit_profile(
-                logger,
-                event="weight_transfer_cleanup",
-                role="writer",
-                backend=self.comm_backend,
-                phase=profile_phase(step_id),
-                step_id=int(step_id),
-                rank=int(self.transfer_rank),
-                resource_cleanup_time_ms=resource_cleanup_time_ms,
-                gc_collect_time_ms=gc_collect_time_ms,
-                gc_collect_skipped=not should_collect_garbage,
-            )
-            if self.enable_mem_debug:
-                if device_util.get_device_type() == "cuda":
-                    torch.cuda.empty_cache()
-                print_current_gpu_status(f"writer-{self.transfer_rank} after cleanup")
+        backend_start = time.perf_counter()
+        metrics = self.device_transport.send(parameters, self.transfer_plan, step_id)
+        device_util.synchronize(device_id=device_util.current_device())
+        metrics["backend_execute_time_ms"] = (
+            time.perf_counter() - backend_start
+        ) * 1000
+        barrier_start = time.perf_counter()
+        dist.barrier(
+            group=self.weights_update_group, device_ids=[device_util.current_device()]
+        )
+        emit_profile(
+            logger,
+            event="weight_transfer",
+            role="writer",
+            backend=self.comm_backend,
+            phase=profile_phase(step_id),
+            step_id=int(step_id),
+            rank=int(self.transfer_rank),
+            capture_bind_time_ms=bind_time_ms,
+            completion_barrier_time_ms=(time.perf_counter() - barrier_start) * 1000,
+            total_transfer_time_ms=(time.perf_counter() - start) * 1000,
+            **metrics,
+        )

@@ -40,9 +40,6 @@ class InferenceConfig:
     pp_size: Optional[int] = None
     dp_size: Optional[int] = None
     ep_size: Optional[int] = None
-    enable_dp_attention: Optional[bool] = None
-    enable_dp_lm_head: Optional[bool] = None
-    moe_dense_tp_size: Optional[int] = None
     nnodes: Optional[int] = None
     node_rank: Optional[int] = None
     local_rank: Optional[int] = None
@@ -83,7 +80,6 @@ class InferenceConfig:
             ("pp_size", self.pp_size),
             ("dp_size", self.dp_size),
             ("ep_size", self.ep_size),
-            ("moe_dense_tp_size", self.moe_dense_tp_size),
             ("weights_comm_nccl_group_size", self.weights_comm_nccl_group_size),
         ]:
             if val is not None and val < 1:

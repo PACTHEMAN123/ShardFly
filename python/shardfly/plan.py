@@ -27,7 +27,7 @@ import torch
 
 from shardfly import logging
 from shardfly._utils.common import _is_allowed_infer_only_alias, to_dict
-from shardfly.metadata.resolver import (
+from shardfly.metadata.parameter import (
     ParameterMeta,
     ParameterReplicaMeta,
     ParameterShardMeta,
@@ -229,7 +229,7 @@ class TransferPlanBuilder:
         else:
             # Two-stage contract: inter transfer requires train keys to exist
             # in infer canonical-ingress metadata.
-            # Infer-only extras are allowed only for known alias coverage.
+            # In non-strict mode transport may generate FP8 scale tensors.
             key_mismatch = bool(missing_on_infer or unsupported_extra_on_infer)
         if key_mismatch:
             logger.error(
@@ -846,8 +846,10 @@ class TransferPlanBuilder:
             grouped_operations[key].sort(
                 key=lambda op: (
                     op.send_shard_meta.name,  # Sort by parameter name first
-                    op.send_offset,  # Then by send offset
-                    op.recv_offset,  # Then by recv offset
+                    op.send_offset,
+                    op.recv_offset,
+                    op.send_shard_meta.global_offset,
+                    op.recv_shard_meta.global_offset,
                 )
             )
         # Sort the keys to ensure consistent iteration order
@@ -986,7 +988,8 @@ def slice_tensor(
         source_offset = op.send_offset if is_train else op.recv_offset
         if is_train:
             slice_context = kwargs.get("slice_context", {})
-            key = f"{param_name}-{slices}"
+            shard_key = getattr(op.send_shard_meta, "tensor_key", param_name)
+            key = (shard_key, tuple((s.start, s.stop, s.step) for s in slices))
             sliced = slice_context.get(key)
             if sliced is not None:
                 return sliced
@@ -1022,6 +1025,8 @@ def compute_transfer_plan_hash(
                     op.recv_rank,
                     op.send_shard_meta.name,
                     op.recv_shard_meta.name,
+                    getattr(op.send_shard_meta, "tensor_key", op.send_shard_meta.name),
+                    getattr(op.recv_shard_meta, "tensor_key", op.recv_shard_meta.name),
                     tuple(op.send_offset),
                     tuple(op.recv_offset),
                     tuple(op.overlap_shape),

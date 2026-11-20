@@ -1,7 +1,7 @@
 """Capture checkpoint slices written by an eager PyTorch model loader."""
 
 from bisect import bisect_left, bisect_right
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from math import prod
 from operator import attrgetter
@@ -11,6 +11,8 @@ import torch
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
+
+from shardfly.capture import CapturedWeights, TensorKey
 
 CAPTURE_ATTRIBUTE = "_shardfly_weight_load_plan"
 
@@ -129,7 +131,6 @@ class _Copy:
     native_name: str
     native_offset: int
     global_shape: tuple[int, ...]
-    global_offset: tuple[int, ...]
     shape: tuple[int, ...]
 
 
@@ -137,7 +138,7 @@ class _Copy:
 class WeightLoadPlan:
     """Rank-local checkpoint mapping. Bindings hold no tensor payloads."""
 
-    _copies: dict[str, _Copy]
+    _copies: dict[tuple[str, tuple[int, ...]], _Copy]
     _parameters: dict[str, _NativeParameter]
 
     def _checked_parameters(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -150,34 +151,51 @@ class WeightLoadPlan:
             parameter.check_binding(native[name])
         return native
 
-    def bind(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
-        """Return checkpoint-named views of the live inference parameters."""
+    def snapshot(self, model: torch.nn.Module, names=None) -> CapturedWeights:
         native = self._checked_parameters(model)
-        return {
-            name: (
+        counts = Counter(name for name, _ in self._copies)
+        capture = CapturedWeights([], {})
+        for (name, offset), copy in sorted(self._copies.items()):
+            if names is not None and name not in names:
+                continue
+            key: TensorKey = name if counts[name] == 1 else (name, offset)
+            tensor = (
                 native[copy.native_name]
                 .detach()
                 .view(-1)
                 .narrow(0, copy.native_offset, prod(copy.shape))
                 .view(copy.shape)
             )
-            for name, copy in self._copies.items()
-        }
-
-    def metadata(self, model: torch.nn.Module) -> list[dict]:
-        self._checked_parameters(model)
-        return [
-            {
+            capture.shards.append({
                 "name": name,
                 "global_shape": copy.global_shape,
-                "global_offset": copy.global_offset,
+                "global_offset": offset,
                 "shape": copy.shape,
-                "dtype": str(self._parameters[copy.native_name].dtype).removeprefix(
-                    "torch."
-                ),
-            }
-            for name, copy in self._copies.items()
-        ]
+                "dtype": str(tensor.dtype).removeprefix("torch."),
+                "binding_key": key,
+            })
+            capture.tensors[key] = tensor
+        return capture
+
+    def bind(self, model: torch.nn.Module) -> dict[TensorKey, torch.Tensor]:
+        return self.snapshot(model).tensors
+
+    def metadata(self, model: torch.nn.Module) -> list[dict]:
+        return self.snapshot(model).shards
+
+
+class LoaderCapture:
+    def __init__(self, model):
+        self._model = model
+        self._plan = getattr(model, CAPTURE_ATTRIBUTE, None)
+        if self._plan is None:
+            raise ValueError("Start vLLM with --load-format shardfly_capture")
+
+    def snapshot(self, names=None) -> CapturedWeights:
+        return self._plan.snapshot(self._model, names)
+
+    def check_binding(self):
+        self._plan._checked_parameters(self._model)
 
 
 def _storage_key(tensor: torch.Tensor):
@@ -194,7 +212,7 @@ class WeightLoadCapture(TorchDispatchMode):
         self._native: dict[int, _NativeParameter] = {}
         self._writes: dict[str, list[tuple[int, int]]] = defaultdict(list)
         self._sources: dict[int, _CheckpointStorage] = {}
-        self._copies: dict[str, _Copy] = {}
+        self._copies: dict[tuple[str, tuple[int, ...]], _Copy] = {}
         self._source_count = 0
         self._reading_checkpoint = False
         self._loading = False
@@ -304,15 +322,15 @@ class WeightLoadCapture(TorchDispatchMode):
                 raise ValueError(
                     f"Expected a direct checkpoint slice for {native.name}"
                 )
-            if source.name in self._copies or not source.shape:
-                raise ValueError(
-                    f"Unsupported multiple or scalar copies for {source.name}"
-                )
-            self._copies[source.name] = _Copy(
+            if not source.shape:
+                raise ValueError(f"Unsupported scalar checkpoint weight {source.name}")
+            key = (source.name, source.get_offset(source_view))
+            if key in self._copies:
+                raise ValueError(f"Repeated checkpoint region for {source.name} at {key[1]}")
+            self._copies[key] = _Copy(
                 native.name,
                 start,
                 source.shape,
-                source.get_offset(source_view),
                 tuple(target.shape),
             )
         elif name == "aten::fill_" and schema.overload_name == "Scalar":

@@ -99,13 +99,13 @@ class ShardFlyPublicationMechanism(PublicationMechanism):
                     else None
                 )
                 harness._training_barrier()
-                harness.megatron_engine.write_weights()
+                harness.training_engine.write_weights()
                 if future is not None:
                     future.result()
 
     def _request_update(self, path: str | None) -> None:
         harness = self.harness
-        payload = {"step_id": harness.megatron_engine.global_step, "kwargs": {}}
+        payload = {"step_id": harness.training_engine.global_step, "kwargs": {}}
         if path is not None:
             payload["kwargs"]["path"] = path
         endpoints = publication_endpoints(harness)

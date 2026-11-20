@@ -27,10 +27,6 @@ from shardfly import logging
 from shardfly._utils import device as device_util
 from shardfly._utils.common import compute_statistics, get_free_port, get_ip_address
 from shardfly._utils.profile import emit_profile, profile_phase
-from shardfly.integrations.models.device_layout import (
-    STATIC_DEVICE_LAYOUT_ARCHITECTURES,
-    annotate_device_transfer_plan,
-)
 from shardfly.integrations.reader.base import WorkerWeightsReader
 from shardfly.plan import (
     TransferPlanBuilder,
@@ -64,15 +60,6 @@ class TransportWorkerReader(WorkerWeightsReader):
         self.transfer_plan = plan_builder.build_local_transfer_plan(
             self.parameters_meta, self.training_params_meta, self.transfer_rank
         )
-        if self.model_arch_name in STATIC_DEVICE_LAYOUT_ARCHITECTURES:
-            annotated = annotate_device_transfer_plan(
-                self.transfer_plan, self.model_arch_name, self.hf_config
-            )
-            logger.info(
-                "Reader rank %s annotated %s source layout operations",
-                self.transfer_rank,
-                annotated,
-            )
         inter_hash = compute_transfer_plan_hash(self.transfer_plan)
         logger.info(
             "Reader rank %s inter plan hash: %s", self.transfer_rank, inter_hash
@@ -116,10 +103,7 @@ class TransportWorkerReader(WorkerWeightsReader):
             num_infer_engines=self.num_engines,
         )
         self.device_transport.resolve_rollout_topology()
-        if self.model_arch_name in STATIC_DEVICE_LAYOUT_ARCHITECTURES:
-            self.device_transport.prepare_recv(
-                self.parameters, self.transfer_plan, allow_staging=False
-            )
+        self.device_transport.prepare_recv(self.parameters, self.transfer_plan)
         self.send_ranks = list(self.transfer_plan.operations.keys())
         self.send_ranks_sample = (
             self.send_ranks[:8] + ["..."] + self.send_ranks[-8:]
@@ -205,6 +189,7 @@ class TransportWorkerReader(WorkerWeightsReader):
     def _destroy_weights_exchange_process_group(self):
         pass
 
+    @torch.inference_mode()
     def _update_weights(self, step_id, **kwargs):
         """
         Asynchronously receive weights from training ranks using torch.distributed.irecv.
@@ -222,6 +207,7 @@ class TransportWorkerReader(WorkerWeightsReader):
         logger.info(
             f"Start to update weights using NCCL for step {step_id} from {len(self.transfer_plan.operations)} ranks({self.send_ranks_sample}) for rank {self.rank_coordinate}."
         )
+        self.capture.check_binding()
         self._init_weights_exchange_process_group()
         start_time = time.perf_counter()
         p2p_op_list = None

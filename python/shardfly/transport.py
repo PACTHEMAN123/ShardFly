@@ -768,7 +768,7 @@ def _build_send_batch(
                 raise TransportUnavailableError(
                     "BF16-to-FP8 transfer requires the blockwise feature on every rank"
                 )
-            parameter = parameters[op.send_shard_meta.name]
+            parameter = parameters[getattr(op.send_shard_meta, "tensor_key", op.send_shard_meta.name)]
             if isinstance(parameter, StaticTensorLayout):
                 if (
                     op.send_tensor_span_numels
@@ -929,7 +929,7 @@ def _build_recv_batch(
                     )
                 order = route_orders[route_key]
             first_fragment = len(tensors)
-            parameter = parameters[op.recv_shard_meta.name]
+            parameter = parameters[getattr(op.recv_shard_meta, "tensor_key", op.recv_shard_meta.name)]
             if parameter.dtype == torch.float8_e4m3fn and not fp8_block_shape:
                 raise TransportUnavailableError(
                     "Native FP8 parameters require the blockwise transfer feature"

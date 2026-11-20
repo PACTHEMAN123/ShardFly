@@ -5,10 +5,10 @@ import pytest
 import torch
 from shardfly.integrations.loader_capture import CAPTURE_ATTRIBUTE, WeightLoadCapture
 from shardfly.integrations.metadata.inference import InferParamMetaResolver
-from shardfly.integrations.metadata.loader_capture import build_captured_parameters_meta
 from shardfly.integrations.reader.base import WorkerWeightsReader
 from shardfly.integrations.sharding.vllm import get_vllm_rank_info
 from shardfly.integrations.vllm.loader import register_capture_loader
+from shardfly.metadata.capture import build_captured_parameters_meta
 from shardfly.plan import TransferPlanBuilder
 
 
@@ -79,18 +79,6 @@ def _capture(model, weights):
 
 
 def test_loader_capture_reuses_transfer_plan_for_changed_weights(monkeypatch):
-    def fail(*args, **kwargs):
-        pytest.fail("The capture path must bypass the inference model registry")
-
-    monkeypatch.setattr(
-        "shardfly.integrations.metadata.inference.get_infer_weights_converter", fail
-    )
-    monkeypatch.setattr(
-        "shardfly.integrations.metadata.inference.get_sharding_strategy_builder", fail
-    )
-    monkeypatch.setattr(
-        "shardfly.integrations.reader.base.get_infer_weights_converter", fail
-    )
     monkeypatch.setattr(
         "shardfly.integrations.reader.base.MetaServerClient", lambda *args: None
     )
@@ -111,9 +99,8 @@ def test_loader_capture_reuses_transfer_plan_for_changed_weights(monkeypatch):
                 for model, context in zip(models, contexts)
             ]
 
-    resolver = InferParamMetaResolver(Engine(), convert_params=True)
+    resolver = InferParamMetaResolver(Engine())
     infer_meta = resolver.get_parameters_meta()
-    assert resolver.uses_loader_capture
     assert {meta.name: meta.global_shape for meta in infer_meta} == {
         name: tensor.shape for name, tensor in weights.items()
     }
@@ -138,7 +125,7 @@ def test_loader_capture_reuses_transfer_plan_for_changed_weights(monkeypatch):
             )
         train_workers.append(
             {
-                "rank_info": resolver._params_raw_meta[rank]["rank_info"],
+                "rank_info": get_vllm_rank_info(contexts[rank], 0),
                 "params_meta": rows,
             }
         )
@@ -150,10 +137,8 @@ def test_loader_capture_reuses_transfer_plan_for_changed_weights(monkeypatch):
     ]
     receivers = [
         WorkerWeightsReader(
-            "vllm",
             model,
             context,
-            {"hf_config": model.config, "loader_capture": True},
             0,
             1,
             "localhost:1234",
@@ -273,3 +258,50 @@ def test_vllm_loader_captures_inside_default_startup(monkeypatch):
         vllm_config.mutate_after_load = True
         with pytest.raises(ValueError, match="modified output after loading"):
             loader.load_model(vllm_config, model_config)
+
+
+def test_capture_multiple_regions_per_rank_survives_rpc_and_binds_each_view(monkeypatch):
+    import json
+
+    from shardfly.capture import capture_inference, capture_training
+    from shardfly.transport import _build_recv_batch, _build_send_batch
+
+    source = torch.nn.Linear(4, 5, bias=False)
+    native = torch.nn.Linear(4, 5, bias=False)
+    with torch.no_grad(), WeightLoadCapture() as tracker:
+        tracker.start(native)
+        for _, tensor in tracker.weights([("weight", source.weight.detach())]):
+            native.weight[2:].copy_(tensor[2:])
+            native.weight[:2].copy_(tensor[:2])
+        tracker.end()
+    setattr(native, CAPTURE_ATTRIBUTE, tracker.finish(native))
+    receiver = capture_inference(native).snapshot()
+    sender = capture_training(source).snapshot()
+    rank = get_vllm_rank_info(_context(0, 1), 0)
+    infer_meta = build_captured_parameters_meta(
+        [{"rank_info": rank, "params_meta": json.loads(json.dumps(receiver.shards))}]
+    )
+    train_meta = build_captured_parameters_meta(
+        [{"rank_info": rank, "params_meta": sender.shards}]
+    )
+    assert len(infer_meta[0].to_local_parameter_meta(0).shards) == 2
+    monkeypatch.setattr("shardfly.transport._ensure_cuda_tensor", lambda *_: None)
+    for logical in (False, True):
+        with torch.no_grad():
+            source.weight.add_(10)
+        builder = TransferPlanBuilder(
+            1, 1, group_replicated_inference=logical,
+            replica_routing="logical" if logical else "engine",
+        )
+        send_plan = builder.build_local_transfer_plan(infer_meta, train_meta, 1)
+        recv_plan = builder.build_local_transfer_plan(infer_meta, train_meta, 0)
+        topology = {"rank_node_ids": ("node", "node")} if logical else {}
+        sent = _build_send_batch(
+            sender.tensors, send_plan, 1, 2, 0, ring_broadcast=logical, **topology
+        )
+        received = _build_recv_batch(
+            receiver.tensors, recv_plan, 0, 2, 0, ring_broadcast=logical, **topology
+        )
+        for destination, payload in zip(received.tensors, sent.tensors, strict=True):
+            destination.copy_(payload)
+        torch.testing.assert_close(native.weight, source.weight)

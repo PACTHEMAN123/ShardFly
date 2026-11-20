@@ -12,21 +12,23 @@ import importlib
 import inspect
 import multiprocessing
 import os
-from pathlib import Path
 import pickle
 import threading
 import time
 import uuid
-from contextlib import nullcontext
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import nullcontext
+from pathlib import Path
 
 import requests
 import torch
 
 from shardfly import logging
 from shardfly.integrations.publication.registry import (
-    PublicationMechanism, publication_endpoints,
-    register_publication_mechanism, register_vllm_publication_receiver,
+    PublicationMechanism,
+    publication_endpoints,
+    register_publication_mechanism,
+    register_vllm_publication_receiver,
 )
 
 logger = logging.getLogger(__name__)
@@ -172,19 +174,6 @@ def _new_engine(backend, config, master):
     return engine_class(**kwargs)
 
 
-def _load_one(model, name, weight):
-    if hasattr(model, "target") and hasattr(model, "draft"):
-        prefix = f"model.layers.{model.num_hidden_layers}."
-        if name.startswith(prefix):
-            aliases = {prefix + "embed_tokens.weight": "model.embed_tokens.weight",
-                       prefix + "shared_head.head.weight": "lm_head.weight"}
-            model.draft.load_weights([(aliases.get(name, name), weight)])
-        else:
-            model.target.load_weights([(name, weight)])
-    else:
-        model.load_weights([(name, weight)])
-
-
 def _load_fp8_weights(model_runner, weights):
     """Use veRL's quantizer and refit lifecycle with recyclable NCCL views.
 
@@ -207,7 +196,9 @@ def _load_fp8_weights(model_runner, weights):
             parameter.orig_type = parameter.__class__
             parameter.__class__ = parameter.subclass_type
     try:
-        from vllm.model_executor.model_loader.mtp_validation import disable_mtp_completeness_check
+        from vllm.model_executor.model_loader.mtp_validation import (
+            disable_mtp_completeness_check,
+        )
     except ImportError:
         disable_mtp_completeness_check = nullcontext
     try:
@@ -268,7 +259,6 @@ class NativeReceiver:
         count = total = 0
         receive_wait_ms = 0
         started = time.perf_counter()
-        architecture = model.config.architectures[0]
         generator = self.engine.receive_weights(global_steps=step_id)
         async def next_weight():
             return await generator.__anext__()
@@ -286,43 +276,23 @@ class NativeReceiver:
                 receive_wait_ms += (time.perf_counter() - wait_start) * 1000
                 count += 1
                 total += weight.numel() * weight.element_size()
-                if architecture == "GptOssForCausalLM" and name.endswith(
-                    (".down_proj_bias", ".down_proj.bias", ".w2_bias")
-                ):
-                    # vLLM zeros this loader input on nonzero TP ranks. Native
-                    # RDMA engines expose a bucket still being forwarded to
-                    # downstream workers, including later TP-rank-zero owners.
-                    # Keep that shared bucket immutable; only this small bias
-                    # tensor needs a private loader copy.
-                    weight = weight.clone()
-                if hasattr(model, "draft") and name.startswith(
-                    f"model.layers.{model.num_hidden_layers}."
-                ):
-                    _load_one(model, name, weight)
-                else:
-                    yield name, weight
-        # Consume each bucket view before advancing the native async iterator;
-        # keep vLLM's original loader initialized once for the full update.
-        target = getattr(model, "target", model)
+                # A loader may mutate its input while a downstream rank
+                # still reads the shared RDMA bucket.
+                yield name, weight.clone() if self.backend != "nccl" else weight
         if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED") == "1":
-            if self.backend != "nccl" or target is not model:
-                raise ValueError("Native FP8 benchmark requires NCCL and one target model")
+            if self.backend != "nccl":
+                raise ValueError("Native FP8 benchmark requires NCCL")
             _load_fp8_weights(self.model_runner, weights())
         else:
             with phase("loader_including_receive"):
-                target.load_weights(weights())
+                model.load_weights(weights())
         with phase("loader_final_sync"):
             torch.cuda.synchronize()
         receive_apply_ms = (time.perf_counter() - started) * 1000
-        post_started = time.perf_counter()
-        if architecture in ("Glm4MoeLiteForCausalLM", "DeepseekV3ForCausalLM"):
-            from shardfly.integrations.models.glm4_moe_lite import GLM47FlashVLLMWeightConverter
-            GLM47FlashVLLMWeightConverter.post_update(None, model)
-        torch.cuda.synchronize()
         return {"worker_rank": self.worker_rank, "received_tensors": count,
                 "payload_bytes": total, "receive_wait_ms": receive_wait_ms,
                 "load_apply_ms": receive_apply_ms - receive_wait_ms,
-                "postprocess_ms": (time.perf_counter() - post_started) * 1000,
+                "postprocess_ms": 0.0,
                 "receive_apply_ms": (time.perf_counter() - started) * 1000}
 
     def close(self):

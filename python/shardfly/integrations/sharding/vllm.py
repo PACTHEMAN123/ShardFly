@@ -15,7 +15,6 @@
 # Portions derived from the Awex project (https://github.com/inclusionAI/Awex),
 # Copyright the Awex developers, licensed under the Apache License, Version 2.0.
 
-from shardfly._utils import device as device_util
 from shardfly.metadata.rank import RankInfo
 
 
@@ -28,33 +27,6 @@ def get_vllm_expert_coordinates(enable_expert_parallel, get_ep_group):
         return group.rank_in_group, group.world_size
     except AssertionError:
         return 0, 1
-
-
-def get_vllm_sharding_strategy(
-    model_name: str, infer_engine_config, rank_info: RankInfo, **kwargs
-):
-    from shardfly.integrations.models.registry import get_sharding_strategy
-
-    cls = get_sharding_strategy(model_name)
-    device_backend = getattr(infer_engine_config, "device_backend", None) or getattr(
-        infer_engine_config, "device_type", None
-    )
-    if isinstance(device_backend, str):
-        device_backend = device_backend.strip().lower()
-    if device_backend is None or device_backend == "":
-        device_backend = device_util.get_device_type()
-    return cls(
-        engine_name="vllm",
-        enable_dp_attention=infer_engine_config.enable_dp_attention,
-        enable_dp_lm_head=infer_engine_config.enable_dp_lm_head,
-        moe_dense_tp_size=infer_engine_config.moe_dense_tp_size,
-        tp_size=rank_info.tp_size,
-        ep_size=infer_engine_config.ep_size,
-        ep_tp_size=rank_info.ep_tp_size,
-        rank_info=rank_info,
-        device_backend=device_backend,
-        **kwargs,
-    )
 
 
 def get_vllm_rank_info(model_context, engine_rank) -> RankInfo:

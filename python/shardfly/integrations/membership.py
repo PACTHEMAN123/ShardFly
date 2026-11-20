@@ -1,4 +1,4 @@
-"""Prepare transport membership against live Megatron/vLLM model storage.
+"""Prepare transport membership against captured training and inference storage.
 
 Applications must finish the previous publication on all ranks first. These
 operations replace only the borrowed transfer group and its transport plans;
@@ -15,7 +15,6 @@ import torch.distributed as dist
 
 from shardfly._utils.common import get_free_port, get_ip_address
 from shardfly._utils.process_group import init_weights_update_group
-from shardfly.integrations.models.qwen3 import annotate_qwen3_dense_transfer_plan
 from shardfly.membership import RolloutMembership
 from shardfly.plan import TransferPlanBuilder
 from shardfly.transport import Transport, _local_node_id
@@ -29,8 +28,6 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
     """
     if worker.comm_backend != "transport":
         raise ValueError("Model membership requires the transport backend")
-    if worker.model_arch_name not in ("Qwen3ForCausalLM", "Qwen3MoeForCausalLM"):
-        raise ValueError("Model membership requires a stable Qwen3 device layout")
     (epoch, engines) = (specification["epoch"], specification["num_engines"])
     transport = worker.device_transport
     if transport is not None:
@@ -56,13 +53,6 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
     phases = []
     started_ns = time.time_ns()
     started = time.perf_counter()
-    models = worker.model if sender else [worker.model]
-    pointers = {
-        f"{stage}/{name}": parameter.data_ptr()
-        for (stage, model) in enumerate(models)
-        for (name, parameter) in model.named_parameters()
-    }
-
     def phase(name, call):
         begin = time.time_ns()
         result = call()
@@ -76,31 +66,23 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
             membership.training_world_size,
             engines,
             worker.enable_debug_mode,
+            strict_param_key_match=True,
         ).build_local_transfer_plan(
             worker.infer_params_meta if sender else worker.parameters_meta,
             worker.parameters_meta if sender else worker.training_params_meta,
             rank,
         ),
     )
-    phase(
-        "model_plan_annotate",
-        lambda: annotate_qwen3_dense_transfer_plan(plan, worker.hf_config),
-    )
     if sender:
-        required = {
-            op.send_shard_meta.name
-            for operations in plan.operations.values()
-            for op in operations
-        }
-        parameters = worker.device_parameters
-        if parameters is None or set(parameters) != required:
-            parameters = phase(
-                "bind_source_views", lambda: worker.compile_device_parameters(required)
-            )
-        if parameters is None:
-            raise ValueError("Model membership requires compiled stable source views")
+        required = worker.required_shards(plan)
+        parameters = phase(
+            "bind_source_views",
+            lambda: worker.bind_source(worker.capture_snapshot(), required),
+        )
     else:
+        worker.capture.check_binding()
         parameters = worker.parameters
+    pointers = {str(key): tensor.data_ptr() for key, tensor in parameters.items()}
     master_key = f"elastic/master/{epoch}"
     if rank == 0:
         worker.meta_server_client.put_object(
@@ -189,12 +171,6 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
         phase(
             "old_process_group_release", lambda: dist.destroy_process_group(old_group)
         )
-    if pointers != {
-        f"{stage}/{name}": parameter.data_ptr()
-        for (stage, model) in enumerate(models)
-        for (name, parameter) in model.named_parameters()
-    }:
-        raise AssertionError("Preparing membership replaced loaded model storage")
     worker.weights_update_group = group
     worker.device_transport = transport
     worker.transfer_plan = plan
@@ -206,7 +182,8 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
     if sender:
         worker.num_infer_engines = engines
         worker.device_parameters = parameters
-        worker.required_param_names = required
+        worker.required_parameters = required
+        worker._prepared_parameters = parameters
         worker.recv_ranks = list(plan.operations)
         worker.recv_ranks_sample = worker.recv_ranks[:8]
         worker.num_to_sends = sum(map(len, plan.operations.values()))

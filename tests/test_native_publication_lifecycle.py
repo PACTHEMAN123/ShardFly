@@ -2,8 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
-from shardfly.integrations.publication.verl_native import NativePublication, NativeReceiver
+from shardfly.integrations.publication.verl_native import (
+    NativePublication,
+    NativeReceiver,
+)
 
 
 @pytest.mark.parametrize("coverage_ok", [True, False])
@@ -72,17 +74,14 @@ def test_completion_reset_rejects_other_backends():
         receiver.configure({"reset_completion": True})
 
 
-@pytest.mark.parametrize("bias_suffix", ["down_proj_bias", "down_proj.bias", "w2_bias"])
-def test_gpt_oss_loader_cannot_zero_bias_in_forwarded_native_bucket(monkeypatch, bias_suffix):
+def test_loader_cannot_mutate_forwarded_native_bucket(monkeypatch):
     import asyncio
     import threading
 
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     bucket = torch.arange(12, dtype=torch.bfloat16)
     original = bucket.clone()
-    names = ["model.layers.0.self_attn.q_proj.weight",
-             "model.layers.0.mlp.experts." + bias_suffix,
-             "model.layers.0.self_attn.k_proj.weight"]
+    names = ["first.weight", "second.bias", "third.weight"]
     forwarded = []
 
     async def receive_weights(global_steps):
@@ -97,21 +96,18 @@ def test_gpt_oss_loader_cannot_zero_bias_in_forwarded_native_bucket(monkeypatch,
     loaded = {}
 
     def load_weights(weights):
-        for index, (name, weight) in enumerate(weights):
+        for name, weight in weights:
             if name == names[1]:
-                assert weight.data_ptr() != bucket[4:8].data_ptr()
-                weight.zero_()  # Real vLLM GPT-OSS nonzero-TP loader behavior.
-            else:
-                assert weight.data_ptr() == bucket[index * 4:].data_ptr()
+                weight.zero_()
             loaded[name] = weight.clone()
 
     receiver = NativeReceiver({"timeout_seconds": 5}, 1)
+    receiver.backend = "mooncake"
     receiver.engine = SimpleNamespace(receive_weights=receive_weights)
     receiver.loop = asyncio.new_event_loop()
     thread = threading.Thread(target=receiver.loop.run_forever)
     thread.start()
-    model = SimpleNamespace(config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
-                            load_weights=load_weights)
+    model = SimpleNamespace(load_weights=load_weights)
     try:
         metrics = receiver.update(model, step_id=3)
         assert metrics["received_tensors"] == 3

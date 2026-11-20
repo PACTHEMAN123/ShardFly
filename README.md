@@ -105,41 +105,60 @@ server started with the package on `PYTHONPATH` exposes the publication API:
 - `POST /publication_init`, `/publication_update`, `/publication_close`
 - `GET /publication_telemetry`
 
-Model converters live in `python/shardfly/integrations/models/`. Workers are
-patched by `python/shardfly/integrations/vllm/plugin.py`, including spawned DP
-workers through `worker_extension.py`.
+### Capture training and inference layouts
 
-### Capture receive layouts at checkpoint load
-
-With a vLLM version that exposes `register_model_loader` and
-`DefaultModelLoader.get_all_weights` (for example v0.21.0), start the serving
-worker with the ShardFly plugin enabled:
+Start each serving worker with the ShardFly plugin and a vLLM version that
+supports `register_model_loader` and `DefaultModelLoader.get_all_weights`
+(for example v0.21.0).
 
 ```sh
 vllm serve /path/to/checkpoint --load-format shardfly_capture
 ```
 
-During the normal checkpoint load, each worker records which checkpoint
-slice populates each native parameter region. The usual `/shardfly_init` and
-`/shardfly_update` flow uses those slices to build the transfer plan and bind
-receive buffers to the live parameters. This removes the need for a
-model-specific vLLM converter or sharding rule for supported loaders. Training
-still supplies checkpoint-named tensors and sharding metadata through its
-existing exporter.
+On each training rank, use the wrapped model after initializing the torch
+distributed process group.
 
-Capture supports unquantized eager loaders that copy rectangular checkpoint
-slices into contiguous native regions, including fused projections and
-zero-padded vocabularies. Each checkpoint tensor contributes at most one slice
-per rank, and the slices must cover a single-axis partition or a replicated full
-tensor. Unsupported transforms, overlapping writes and changes to the native
-parameter layout fail with the affected parameter or operation in the error.
+```python
+from shardfly.capture import capture_training
+from shardfly.integrations.engine import CapturedTrainingEngine
 
-## veRL adapter
+engine = CapturedTrainingEngine(capture_training(model), meta_server_addr=address)
+# After each optimizer step, concurrently with POST /shardfly_update.
+engine.set_global_step(step_id)
+engine.write_weights()
+```
 
-`python/shardfly/integrations/verl/` provides a checkpoint-engine adapter and
-locality-aware Ray placement. The native NCCL publication path in
-`integrations/publication/verl_native.py` uses the same transport and supports
-FP8 checkpoints.
+Start one metadata server with `shardfly.control.store.start_meta_server()` and
+share its `host:port` with all training ranks. Call `POST /shardfly_init` with
+that `meta_server_addr` before the first update. The loader and training engine
+produce the same local shard records and Tensor bindings. ShardFly plans transfers from the recorded regions. Both sides
+must use the checkpoint's parameter names and element order.
+
+Training capture uses the PyTorch Distributed Checkpoint local save plan.
+FSDP1, FSDP2, and DCP-compatible meshes use the same entry point. For a custom
+export, pass `capture_training(model, state_dict=export)`, where `export(model)`
+returns a DCP-compatible sharded state dict with checkpoint names. The writer
+selects entries that the inference loader recorded, and every recorded target
+must have a complete training source. It stages materialized or CPU shards and
+converts FP32, BF16, and FP16 weights to the receiver's dtype when needed.
+Use `stage=True` when a wrapper may replace live parameter storage between
+updates. With stable CUDA storage and matching dtypes, directly addressable
+source views can be sent in place.
+
+The vLLM loader captures direct rectangular copies into contiguous regions,
+including fused projections and zero-padded vocabularies. Quantized and
+speculative checkpoint loads are outside the capture path. Captured regions
+must tile each tensor without overlap and with uniform replication. The CUDA
+sender requires contiguous or single-row-stride transfer views.
+
+### veRL
+
+The `shardfly` checkpoint backend uses the same capture for the actor's
+`module`. FSDP actors use DCP by default. An actor can supply
+`shardfly_state_dict(module)` to expose its existing canonical export.
+Use `--load-format shardfly_capture` for the rollout workers. The separate native
+checkpoint benchmark delegates loading and optional FP8 quantization to
+veRL and vLLM.
 
 ## Tests
 
