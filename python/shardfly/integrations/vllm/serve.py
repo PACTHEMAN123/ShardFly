@@ -33,11 +33,9 @@ except ImportError:
     )
 
 try:
-    from vllm.entrypoints.utils import cli_env_setup
+    from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
 except ImportError:
-    # Newer vLLM releases perform this setup in their CLI entrypoint.
-    def cli_env_setup():
-        pass
+    from vllm.entrypoints.utils import cli_env_setup
 
 
 try:

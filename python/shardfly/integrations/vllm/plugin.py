@@ -33,9 +33,12 @@ from shardfly.integrations.vllm.server import ShardFlyVLLMServerAdapter
 
 logger = logging.getLogger(__name__)
 try:
-    from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
+    from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel
 except ImportError:
-    from vllm.entrypoints.openai.protocol import OpenAIBaseModel
+    try:
+        from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
+    except ImportError:
+        from vllm.entrypoints.openai.protocol import OpenAIBaseModel
 try:
     from vllm.entrypoints.openai.api_server import router
 
