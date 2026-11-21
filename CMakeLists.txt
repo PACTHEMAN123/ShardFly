@@ -22,7 +22,7 @@ set_target_properties(shardfly PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(shardfly PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-  "${NCCL_INCLUDE_DIR}")
+  $<BUILD_INTERFACE:${NCCL_INCLUDE_DIR}>)
 target_include_directories(shardfly PRIVATE include/shardfly)
 target_link_libraries(shardfly PUBLIC CUDA::cudart "${NCCL_LIBRARY}" ${CMAKE_DL_LIBS})
 target_compile_definitions(shardfly PUBLIC NCCL_OS_LINUX)
