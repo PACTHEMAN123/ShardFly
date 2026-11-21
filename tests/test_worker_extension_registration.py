@@ -8,6 +8,10 @@ import pytest
 
 def test_spawned_worker_patches_shardfly(monkeypatch):
     calls = []
+    monkeypatch.setattr(
+        "shardfly.integrations.vllm.loader.register_capture_loader",
+        lambda: calls.append("register_capture_loader"),
+    )
     module = types.ModuleType("shardfly.integrations.vllm.plugin")
     module._patch_shardfly_worker = lambda: calls.append("_patch_shardfly_worker")
     monkeypatch.setitem(sys.modules, "shardfly.integrations.vllm.plugin", module)
@@ -18,12 +22,15 @@ def test_spawned_worker_patches_shardfly(monkeypatch):
             / "python/shardfly/integrations/vllm/worker_extension.py"
         )
     )
-    assert calls == ["_patch_shardfly_worker"]
+    assert calls == ["register_capture_loader", "_patch_shardfly_worker"]
 
 
 @pytest.mark.parametrize("enabled", [None, "0", "1"])
 def test_verl_fp8_patch_is_opt_in(monkeypatch, enabled):
     calls = []
+    monkeypatch.setattr(
+        "shardfly.integrations.vllm.loader.register_capture_loader", lambda: None
+    )
     patch_module = types.ModuleType("shardfly.integrations.vllm.plugin")
     patch_module._patch_shardfly_worker = lambda: None
     quant_module = types.ModuleType("verl.utils.vllm.vllm_quant_utils")

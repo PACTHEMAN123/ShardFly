@@ -96,7 +96,10 @@ class TransportWriter(WeightsExchangeShardingWriter):
             for op in ops
         }
         self.device_parameters = None
-        if self.model_arch_name in STATIC_DEVICE_LAYOUT_ARCHITECTURES:
+        if (
+            self.model_arch_name in STATIC_DEVICE_LAYOUT_ARCHITECTURES
+            and not self.load_source.needs_rebinding
+        ):
             self.device_parameters = self.compile_device_parameters(
                 self.required_param_names
             )
@@ -249,9 +252,15 @@ class TransportWriter(WeightsExchangeShardingWriter):
                         f"writer-{self.transfer_rank} before convert"
                     )
                 convert_start = time.perf_counter()
-                parameters = self.convert_parameters(
-                    required_names=self.required_param_names
-                )
+                if (
+                    self.load_source.needs_rebinding
+                    and self.model_arch_name in STATIC_DEVICE_LAYOUT_ARCHITECTURES
+                ):
+                    parameters = self.compile_device_parameters(self.required_param_names)
+                if parameters is None:
+                    parameters = self.convert_parameters(
+                        required_names=self.required_param_names
+                    )
                 convert_time_ms = (time.perf_counter() - convert_start) * 1000.0
                 logger.info("Writer: Converting parameters completed")
                 if self.enable_mem_debug:

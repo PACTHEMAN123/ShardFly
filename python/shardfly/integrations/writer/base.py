@@ -36,6 +36,7 @@ from shardfly._utils.common import (
 from shardfly._utils.gpu import get_gpu_status
 from shardfly.control.store import MetaServerClient
 from shardfly.integrations.conversion.megatron import get_mcore_model_parameters
+from shardfly.integrations.megatron_loader import MegatronLoadSource
 from shardfly.integrations.metadata.training import McoreParamMetaResolver
 from shardfly.integrations.models.registry import get_train_weights_converter
 from shardfly.integrations.sharding import get_rank_info_extractor
@@ -110,9 +111,6 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
     def _initialize(self):
         rank = dist.get_rank()
         logger.info(f"Initializing weights exchange sharding writer for rank {rank}")
-        self.infer_conf = self.meta_server_client.get_object(
-            "infer_conf", timeout=self.timeout
-        )
         logger.info(f"Got inference config from meta server: {self.infer_conf}")
         self.infer_engine_config = self.infer_conf["infer_engine_config"]
         self.infer_world_size = self.infer_conf["infer_world_size"]
@@ -332,16 +330,24 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
             )
             try:
                 if not self.initialized:
-                    logger.info("Start to initialize weights exchange sharding writer")
-                    self._initialize()
-                    self.initialized = True
-                    logger.info(
-                        "Finished initializing weights exchange sharding writer"
+                    self.infer_conf = self.meta_server_client.get_object(
+                        "infer_conf", timeout=self.timeout
                     )
-                self._validate_weights(step_id, **kwargs)
-                start_time = time.time()
-                self._write_weights(step_id, **kwargs)
-                duration = time.time() - start_time
+                    self.load_source = MegatronLoadSource(
+                        self.model if self.infer_conf.get("loader_capture", False) else ()
+                    )
+                with self.load_source.publication():
+                    if not self.initialized:
+                        logger.info("Start to initialize weights exchange sharding writer")
+                        self._initialize()
+                        self.initialized = True
+                        logger.info(
+                            "Finished initializing weights exchange sharding writer"
+                        )
+                    self._validate_weights(step_id, **kwargs)
+                    start_time = time.time()
+                    self._write_weights(step_id, **kwargs)
+                    duration = time.time() - start_time
                 compute_statistics(
                     self._history_write_weights_time, step_id, duration, "Write weights"
                 )

@@ -1,10 +1,12 @@
 """Opt-in vLLM checkpoint loader that captures ShardFly receive layouts."""
 
 from copy import copy
+from functools import cache
 
 from shardfly.integrations.loader_capture import CAPTURE_ATTRIBUTE, WeightLoadCapture
 
 
+@cache
 def register_capture_loader():
     from vllm.model_executor import model_loader
 
@@ -34,7 +36,15 @@ def register_capture_loader():
                     )
                 finally:
                     self._capture = None
-            setattr(model, CAPTURE_ATTRIBUTE, capture.finish(model))
+            plan = capture.finish(model)
+            if getattr(getattr(model_config, "hf_config", None), "tie_word_embeddings", False):
+                from vllm.distributed import get_pp_group
+
+                if get_pp_group().is_last_rank:
+                    plan = plan.with_checkpoint_alias(
+                        "lm_head.weight", "model.embed_tokens.weight"
+                    )
+            setattr(model, CAPTURE_ATTRIBUTE, plan)
             return model
 
         def load_weights(self, model, model_config):

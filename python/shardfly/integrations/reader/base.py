@@ -625,12 +625,12 @@ class WorkerWeightsReader:
     def initialize(self):
         if self.load_plan is not None:
             self.parameters = self.load_plan.bind(self.model)
-        else:
-            self.parameters = {
-                hf_name: hf_param
-                for (name, param) in self.model.named_parameters()
-                for (hf_name, hf_param) in self.weight_converter.convert_param(name, param)
-            }
+            return
+        self.parameters = {
+            hf_name: hf_param
+            for (name, param) in self.model.named_parameters()
+            for (hf_name, hf_param) in self.weight_converter.convert_param(name, param)
+        }
         if (
             getattr(self.hf_config, "tie_word_embeddings", False)
             and self.rank_info.pp_rank == self.rank_info.pp_size - 1

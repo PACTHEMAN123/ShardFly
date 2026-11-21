@@ -1,5 +1,7 @@
 """Capture checkpoint slices written by an eager PyTorch model loader."""
 
+from __future__ import annotations
+
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -44,27 +46,34 @@ class _CheckpointTensor:
     byte_start: int
     byte_end: int
 
-    def get_offset(self, view: torch.Tensor) -> tuple[int, ...]:
+    def get_region(self, view: torch.Tensor) -> tuple[tuple[int, ...], tuple[int, ...]]:
         remaining = view.storage_offset() - self.offset
         offsets = []
+        sizes = []
         if (
-            view.ndim != len(self.shape)
-            or view.dtype != self.dtype
+            view.dtype != self.dtype
             or view.is_conj()
             or view.is_neg()
             or remaining < 0
         ):
             raise ValueError(f"Unsupported checkpoint slice for {self.name}")
-        for size, stride, full_size, full_stride in zip(
-            view.shape, view.stride(), self.shape, self.strides
-        ):
+        varying_axes = iter(
+            (size, stride) for size, stride in zip(view.shape, view.stride()) if size > 1
+        )
+        active = next(varying_axes, None)
+        for full_size, full_stride in zip(self.shape, self.strides):
             offset, remaining = divmod(remaining, full_stride)
-            if offset + size > full_size or (size > 1 and stride != full_stride):
+            size = 1
+            if full_size > 1 and active is not None and active[1] == full_stride:
+                size = active[0]
+                active = next(varying_axes, None)
+            if offset + size > full_size:
                 raise ValueError(f"Unsupported checkpoint slice for {self.name}")
             offsets.append(offset)
-        if remaining:
-            raise ValueError(f"Misaligned checkpoint slice for {self.name}")
-        return tuple(offsets)
+            sizes.append(size)
+        if active is not None or remaining:
+            raise ValueError(f"Unsupported checkpoint slice for {self.name}")
+        return tuple(offsets), tuple(sizes)
 
 
 @dataclass
@@ -139,6 +148,11 @@ class WeightLoadPlan:
 
     _copies: dict[str, _Copy]
     _parameters: dict[str, _NativeParameter]
+
+    def with_checkpoint_alias(self, name: str, source: str) -> WeightLoadPlan:
+        if name in self._copies or source not in self._copies:
+            return self
+        return WeightLoadPlan({**self._copies, name: self._copies[source]}, self._parameters)
 
     def _checked_parameters(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
         native = {
@@ -308,12 +322,13 @@ class WeightLoadCapture(TorchDispatchMode):
                 raise ValueError(
                     f"Unsupported multiple or scalar copies for {source.name}"
                 )
+            offset, shape = source.get_region(source_view)
             self._copies[source.name] = _Copy(
                 native.name,
                 start,
                 source.shape,
-                source.get_offset(source_view),
-                tuple(target.shape),
+                offset,
+                shape,
             )
         elif name == "aten::fill_" and schema.overload_name == "Scalar":
             value = args[1] if len(args) > 1 else kwargs["value"]

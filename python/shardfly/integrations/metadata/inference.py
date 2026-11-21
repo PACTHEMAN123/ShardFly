@@ -220,15 +220,7 @@ class InferParamMetaResolver(ParamMetaResolver):
             "model_arch_name": model_arch_name,
         }
         if convert_params and (capture := getattr(model, CAPTURE_ATTRIBUTE, None)) is not None:
-            captured = capture.metadata(model)
-            if (
-                getattr(hf_config, "tie_word_embeddings", False)
-                and rank_info.pp_rank == rank_info.pp_size - 1
-            ):
-                by_name = {param["name"]: param for param in captured}
-                if "model.embed_tokens.weight" in by_name and "lm_head.weight" not in by_name:
-                    captured.append(dict(by_name["model.embed_tokens.weight"], name="lm_head.weight"))
-            return dict(meta, loader_capture=True, params_meta=captured)
+            return dict(meta, loader_capture=True, params_meta=capture.metadata(model))
 
         params = []
         if convert_params:

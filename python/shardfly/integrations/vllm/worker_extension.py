@@ -8,6 +8,8 @@ and forked workers use the same implementation.
 
 import os
 
+from shardfly.integrations.vllm.loader import register_capture_loader
+
 if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED") == "1":
     # veRL records checkpoint layouts during the initial vLLM model load.
     from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
@@ -16,6 +18,7 @@ if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED") == "1":
 
 from shardfly.integrations.vllm.plugin import _patch_shardfly_worker
 
+register_capture_loader()
 _patch_shardfly_worker()
 
 

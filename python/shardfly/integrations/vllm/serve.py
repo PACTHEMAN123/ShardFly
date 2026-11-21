@@ -35,6 +35,7 @@ except ImportError:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from shardfly import logging
+from shardfly.integrations.vllm.loader import register_capture_loader
 from shardfly.integrations.vllm.plugin import register_shardfly_routes
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 def main():
     # Register ShardFly routes + worker patches directly (not via vLLM plugin system).
+    register_capture_loader()
     register_shardfly_routes()
 
     cli_env_setup()
