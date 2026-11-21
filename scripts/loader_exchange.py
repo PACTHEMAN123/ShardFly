@@ -108,9 +108,8 @@ class Exchange:
         self.publication = ShardFlyPublicationMechanism(self)
 
     def publication_endpoints(self):
-        for rank, url in enumerate(self.args.rollout):
-            parts = urlsplit(url)
-            yield rank, parts.hostname, parts.port
+        parts = [urlsplit(url) for url in self.args.rollout]
+        return [(rank, url.hostname, url.port) for rank, url in enumerate(parts)]
 
     def _training_barrier(self):
         dist.barrier(device_ids=[torch.cuda.current_device()])
@@ -168,6 +167,9 @@ class Exchange:
 
 def main():
     args = parse_args()
+    if int(os.environ["RANK"]) == 0:
+        for url in args.rollout:
+            requests.get(f"{url}/health", timeout=10).raise_for_status()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(minutes=10))
     is_driver = dist.get_rank() == 0

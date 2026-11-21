@@ -129,10 +129,28 @@ existing exporter.
 
 Capture supports unquantized eager loaders that copy rectangular checkpoint
 slices into contiguous native regions, including fused projections and
-zero-padded vocabularies. Each checkpoint tensor contributes at most one slice
-per rank, and the slices must cover a single-axis partition or a replicated full
-tensor. Unsupported transforms, overlapping writes and changes to the native
-parameter layout fail with the affected parameter or operation in the error.
+zero-padded vocabularies. Loaders may insert or remove singleton dimensions
+before a copy. Each checkpoint tensor contributes at most one slice per rank,
+and the slices must cover a single-axis partition or a replicated full tensor.
+Unsupported transforms, overlapping writes and changes to the native parameter
+layout fail with the affected parameter or operation in the error.
+
+For a two-host publication check, start the rollout server with
+`--load-format shardfly_capture` on one host and run this on the Megatron host:
+
+```sh
+torchrun --standalone --nproc-per-node=2 scripts/loader_exchange.py \
+  --model /path/to/checkpoint --metadata-host TRAINER_IP \
+  --rollout http://ROLLOUT_IP:8000 --tp 2 --verify
+```
+
+`--verify` clears the rollout weights before each update and compares every
+native parameter with the checkpoint-loaded reference after the update. The
+timing excludes both operations. Repeat `--rollout` for independent replicas.
+Use `--mfsdp optim_grads` or `--mfsdp optim_grads_params` with the desired trainer
+parallelism to exercise Megatron-FSDP. ShardFly invokes Megatron-FSDP's parameter
+synchronization for each publication and releases the gathered weights after
+the send completes.
 
 ## veRL adapter
 
