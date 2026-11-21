@@ -61,7 +61,8 @@ def load_training_model(args):
     model_parallel_cuda_manual_seed(42)
     hf_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     bridge = AutoBridge.from_hf_pretrained(args.model, trust_remote_code=True)
-    provider = bridge.to_megatron_provider(load_weights=False)
+    # Load into the raw model before Megatron-FSDP installs its weight buffers.
+    provider = bridge.to_megatron_provider(load_weights=True)
     for name, size in parallelism.items():
         setattr(provider, name, size)
     provider.sequence_parallel = args.tp > 1
@@ -81,7 +82,6 @@ def load_training_model(args):
         bf16=provider.bf16,
         fp16=provider.fp16,
     )
-    bridge.load_hf_weights(models, args.model)
     return models, hf_config
 
 
