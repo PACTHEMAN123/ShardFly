@@ -653,6 +653,8 @@ class WorkerWeightsReader:
         ) * 1000.0
         update_body_start = time.perf_counter()
         self._update_weights(step_id, **kwargs)
+        if self.load_plan is not None:
+            self.load_plan.refresh(self.model)
         post_update = getattr(self.weight_converter, "post_update", None)
         if callable(post_update):
             post_update(self.model)

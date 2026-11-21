@@ -232,6 +232,32 @@ def test_capture_keeps_checkpoint_coordinates_when_loader_squeezes_weight():
     torch.testing.assert_close(plan.bind(model)["weight"], checkpoint[:, 1:2])
 
 
+def test_capture_refreshes_parameters_derived_after_loading():
+    model = torch.nn.Linear(2, 3, bias=False)
+    checkpoint = torch.arange(6.0).view(3, 2)
+    with torch.no_grad(), WeightLoadCapture() as capture:
+        capture.start(model)
+        for _, weight in capture.weights([("weight", checkpoint)]):
+            model.weight.copy_(weight)
+        capture.end()
+        model.derived = torch.nn.Parameter(model.weight * 2, requires_grad=False)
+
+    def prepare_refresh(names):
+        assert names == {"derived"}
+
+        def refresh(target):
+            target.derived.copy_(target.weight * 2)
+
+        return refresh
+
+    plan = capture.finish(model, prepare_refresh)
+    assert set(plan.bind(model)) == {"weight"}
+    assert [param["name"] for param in plan.metadata(model)] == ["weight"]
+    plan.bind(model)["weight"].copy_(checkpoint + 1)
+    plan.refresh(model)
+    torch.testing.assert_close(model.derived, (checkpoint + 1) * 2)
+
+
 def test_mfsdp_loader_borrows_parameters_for_each_publication():
     calls = []
     module = SimpleNamespace(

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import prod
 from operator import attrgetter
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
@@ -119,6 +119,17 @@ class _NativeParameter:
     offset: int
     dtype: torch.dtype
 
+    @classmethod
+    def from_tensor(cls, name: str, param: torch.Tensor) -> _NativeParameter:
+        return cls(
+            name,
+            StorageWeakRef(param.untyped_storage()),
+            tuple(param.shape),
+            tuple(param.stride()),
+            param.storage_offset(),
+            param.dtype,
+        )
+
     def check_binding(self, param: torch.Tensor):
         if (
             self.storage.expired()
@@ -148,21 +159,32 @@ class WeightLoadPlan:
 
     _copies: dict[str, _Copy]
     _parameters: dict[str, _NativeParameter]
+    _refresh_derived: Callable[[torch.nn.Module], None] | None = None
 
     def with_checkpoint_alias(self, name: str, source: str) -> WeightLoadPlan:
         if name in self._copies or source not in self._copies:
             return self
-        return WeightLoadPlan({**self._copies, name: self._copies[source]}, self._parameters)
+        return replace(self, _copies={**self._copies, name: self._copies[source]})
 
     def _checked_parameters(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
         native = {
             name: param for name, param in model.named_parameters() if param.numel()
         }
         if native.keys() != self._parameters.keys():
-            raise ValueError("Loader changed the set of native parameters")
+            removed = sorted(self._parameters.keys() - native.keys())[:5]
+            added = sorted(native.keys() - self._parameters.keys())[:5]
+            raise ValueError(
+                f"Loader changed the set of native parameters: removed={removed}, added={added}"
+            )
         for name, parameter in self._parameters.items():
             parameter.check_binding(native[name])
         return native
+
+    @torch.no_grad()
+    def refresh(self, model: torch.nn.Module) -> None:
+        if self._refresh_derived is not None:
+            self._refresh_derived(model)
+            self._checked_parameters(model)
 
     def bind(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
         """Return checkpoint-named views of the live inference parameters."""
@@ -222,14 +244,7 @@ class WeightLoadCapture(TorchDispatchMode):
             key = _storage_key(param)
             if key is None or not param.is_contiguous() or key in self._native:
                 raise ValueError(f"Unsupported native parameter storage for {name}")
-            self._native[key] = _NativeParameter(
-                name,
-                StorageWeakRef(param.untyped_storage()),
-                tuple(param.shape),
-                tuple(param.stride()),
-                param.storage_offset(),
-                param.dtype,
-            )
+            self._native[key] = _NativeParameter.from_tensor(name, param)
         self._loading = True
 
     def end(self):
@@ -275,7 +290,11 @@ class WeightLoadCapture(TorchDispatchMode):
             return storage.find(tensor)
         return None
 
-    def finish(self, model: torch.nn.Module) -> WeightLoadPlan:
+    def finish(
+        self,
+        model: torch.nn.Module,
+        prepare_refresh: Callable[[set[str]], Callable[[torch.nn.Module], None]] | None = None,
+    ) -> WeightLoadPlan:
         if self._loading or not self._copies:
             raise ValueError("Model loader did not capture any checkpoint copies")
         parameters = {param.name: param for param in self._native.values()}
@@ -289,7 +308,15 @@ class WeightLoadCapture(TorchDispatchMode):
                 cursor = end
             if cursor != prod(parameter.shape):
                 raise ValueError(f"Incomplete writes to {parameter.name}")
-        plan = WeightLoadPlan(dict(self._copies), parameters)
+        live = {name: param for name, param in model.named_parameters() if param.numel()}
+        derived = live.keys() - parameters.keys()
+        refresh = None
+        if derived and prepare_refresh is not None:
+            refresh = prepare_refresh(derived)
+            parameters.update(
+                (name, _NativeParameter.from_tensor(name, live[name])) for name in derived
+            )
+        plan = WeightLoadPlan(dict(self._copies), parameters, refresh)
         plan._checked_parameters(model)
         return plan
 

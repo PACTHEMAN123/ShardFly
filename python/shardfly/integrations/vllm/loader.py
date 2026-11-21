@@ -1,9 +1,36 @@
 """Opt-in vLLM checkpoint loader that captures ShardFly receive layouts."""
 
 from copy import copy
-from functools import cache
+from functools import cache, partial
 
 from shardfly.integrations.loader_capture import CAPTURE_ATTRIBUTE, WeightLoadCapture
+
+
+def _prepare_attention_refresh(derived_names, *, model, model_config):
+    from vllm.model_executor.model_loader import utils
+
+    is_deferred = getattr(utils, "is_deferred_attention_layer", None)
+    if is_deferred is None:
+        attention_classes = (utils.Attention, utils.MLAAttention, utils.MMEncoderAttention)
+
+        def is_deferred(module):
+            return isinstance(module, attention_classes) and hasattr(
+                module, "process_weights_after_loading"
+            )
+
+    modules = dict(model.named_modules())
+    owners = {name.rpartition(".")[0] for name in derived_names}
+    unsupported = sorted(name for name in owners if not is_deferred(modules[name]))
+    if unsupported:
+        raise ValueError(f"Loader added parameters outside deferred attention: {unsupported[:5]}")
+    owners = sorted(owners)
+    dtype = model_config.dtype
+
+    def refresh(target):
+        for name in owners:
+            target.get_submodule(name).process_weights_after_loading(dtype)
+
+    return refresh
 
 
 @cache
@@ -36,7 +63,12 @@ def register_capture_loader():
                     )
                 finally:
                     self._capture = None
-            plan = capture.finish(model)
+            plan = capture.finish(
+                model,
+                prepare_refresh=partial(
+                    _prepare_attention_refresh, model=model, model_config=model_config
+                ),
+            )
             if getattr(getattr(model_config, "hf_config", None), "tie_word_embeddings", False):
                 from vllm.distributed import get_pp_group
 
