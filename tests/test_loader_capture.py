@@ -4,6 +4,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 from shardfly.integrations.loader_capture import CAPTURE_ATTRIBUTE, WeightLoadCapture
+from shardfly.integrations.megatron_loader import MegatronLoadSource
 from shardfly.integrations.metadata.inference import InferParamMetaResolver
 from shardfly.integrations.metadata.loader_capture import build_captured_parameters_meta
 from shardfly.integrations.reader.base import WorkerWeightsReader
@@ -213,6 +214,40 @@ def test_capture_refuses_replaced_native_parameter():
     model.output = torch.nn.Parameter(model.output.clone(), requires_grad=False)
     with pytest.raises(ValueError, match="changed the storage or layout of output"):
         plan.bind(model)
+
+
+def test_capture_keeps_checkpoint_coordinates_when_loader_squeezes_weight():
+    model = torch.nn.Linear(2, 3, bias=False)
+    checkpoint = torch.arange(12.0).view(3, 2, 2)
+    with torch.no_grad(), WeightLoadCapture() as capture:
+        capture.start(model)
+        for _, weight in capture.weights([("weight", checkpoint)]):
+            model.weight.copy_(weight.select(1, 1))
+        capture.end()
+
+    plan = capture.finish(model)
+    metadata = plan.metadata(model)[0]
+    assert metadata["global_offset"] == (0, 1, 0)
+    assert metadata["shape"] == (3, 1, 2)
+    torch.testing.assert_close(plan.bind(model)["weight"], checkpoint[:, 1:2])
+
+
+def test_mfsdp_loader_borrows_parameters_for_each_publication():
+    calls = []
+    module = SimpleNamespace(
+        all_gather_pipeline=object(),
+        data_parallel_sharding_strategy="optim_grads_params",
+        start_param_sync=lambda **kw: calls.append(("gather", kw["force_sync"])),
+        synchronize_param_gather=lambda: calls.append("reshard"),
+    )
+    source = MegatronLoadSource([SimpleNamespace(module=module)])
+    assert source.needs_rebinding
+    with source.publication():
+        calls.append("publish")
+    with pytest.raises(RuntimeError, match="failed update"):
+        with source.publication():
+            raise RuntimeError("failed update")
+    assert calls == [("gather", True), "publish", "reshard", ("gather", True), "reshard"]
 
 
 def test_captured_metadata_rejects_incomplete_checkpoint_coverage():

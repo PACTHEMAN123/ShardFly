@@ -529,10 +529,9 @@ def _ensure_router_attached() -> None:
     if _USING_LEGACY_VLLM_ROUTER or _shardfly_build_app_patched:
         return
     try:
+        from vllm.entrypoints.launchers.api_server import entry as _api_server_module
+    except ImportError:
         from vllm.entrypoints.openai import api_server as _api_server_module
-    except ImportError as exc:
-        logger.warning("Cannot patch vLLM build_app for ShardFly routes: %s", exc)
-        return
     original_build_app = getattr(_api_server_module, "build_app", None)
     if original_build_app is None:
         logger.warning(

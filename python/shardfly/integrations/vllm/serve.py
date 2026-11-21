@@ -18,8 +18,19 @@
 """vLLM OpenAI API server entrypoint with ShardFly routes registered."""
 
 import uvloop
-from vllm.entrypoints.openai.api_server import run_server
-from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
+
+try:
+    from vllm.entrypoints.launchers.api_server.entry import run_server
+    from vllm.entrypoints.launchers.cli_args import (
+        make_arg_parser,
+        validate_parsed_serve_args,
+    )
+except ImportError:
+    from vllm.entrypoints.openai.api_server import run_server
+    from vllm.entrypoints.openai.cli_args import (
+        make_arg_parser,
+        validate_parsed_serve_args,
+    )
 
 try:
     from vllm.entrypoints.utils import cli_env_setup
