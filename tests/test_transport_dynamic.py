@@ -75,6 +75,24 @@ def test_expansion_releases_old_fifo_rebuilds_ring_and_preserves_weights(prepare
         transport.send(params, old_plan, 4)
 
 
+def test_prepared_update_dispatches_only_the_handle_role_and_sequence(prepared, monkeypatch):
+    transport, params, plan, *_ = prepared
+    monkeypatch.delenv("SHARDFLY_PROFILE", raising=False)
+    launches = []
+    transport._extension.launch = lambda *args: launches.append("descriptors") or {}
+    transport._extension.launch_prepared = lambda *args: launches.append(args) or {}
+
+    transport.send(params, plan, 0)
+    transport.send(params, plan, 1)
+    transport.send(params, plan, 2)
+
+    assert launches == [
+        "descriptors",
+        (42, True, module._sequence_from_step(1), False),
+        (42, True, module._sequence_from_step(2), False),
+    ]
+
+
 def test_expansion_refreshes_source_node_ring_seeds(prepared, monkeypatch):
     transport, params, _, _, members, group = prepared
     transport.ring_source_node_swizzle = True

@@ -46,17 +46,12 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   }
   auto stream = at::cuda::getCurrentCUDAStream(shardfly::device(handle)).stream();
   shardfly::Metrics metrics;
-  auto invoke = [&] {
-    return shardfly::launch(handle, views, lengths, tensor_offsets, tensor_row_bytes,
+  {
+    // The driver may still be sending the rollout's update RPC on another thread.
+    py::gil_scoped_release release;
+    metrics = shardfly::launch(handle, views, lengths, tensor_offsets, tensor_row_bytes,
       tensor_row_strides, peers, ordinals, expected_counts, forward_peers, ring_ids,
       sender, sequence, quantization, prepare_only, stream);
-  };
-  if (prepare_only) {
-    py::gil_scoped_release release;
-    metrics = invoke();
-  } else {
-    // Preserve the original steady transfer call's GIL ownership.
-    metrics = invoke();
   }
   return py::cast(metrics);
 }
@@ -84,6 +79,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              py::arg("ring_ids"), py::arg("sender"), py::arg("sequence"),
              py::arg("quantization") = std::vector<std::vector<int64_t>>{},
              py::arg("prepare_only") = false);
+  module.def("launch_prepared", [](int64_t handle, bool sender, int64_t sequence, bool profile_device) {
+    auto stream = at::cuda::getCurrentCUDAStream(shardfly::device(handle)).stream();
+    shardfly::Metrics metrics;
+    {
+      py::gil_scoped_release release;
+      metrics = shardfly::launch_prepared(handle, sender, sequence, profile_device, stream);
+    }
+    return py::cast(metrics);
+  });
   module.def("prepare", [](int64_t handle, const py::list& tensors,
                 const std::vector<int64_t>& lengths, const std::vector<int64_t>& tensor_offsets,
                 const std::vector<int64_t>& tensor_row_bytes, const std::vector<int64_t>& tensor_row_strides,

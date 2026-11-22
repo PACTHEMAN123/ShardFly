@@ -16,100 +16,137 @@
 # Copyright the Awex developers, licensed under the Apache License, Version 2.0.
 
 
+"""Collect rollout captures, initialize the reader, and receive publication updates."""
+
 import os
 import pickle
 import threading
 import time
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 
 from shardfly import logging
 from shardfly._utils import device as device_util
 from shardfly._utils.common import (
-    check_train_infer_params_meta,
     compute_statistics,
-    simple_hf_config,
+    get_free_port,
+    get_ip_address,
     stripped_env_vars,
 )
-from shardfly._utils.profile import emit_profile, profile_phase
 from shardfly._utils.tensor import (
     check_and_log_nan_values,
     compare_and_log_tensor_differences,
 )
+from shardfly.capture import capture_inference
 from shardfly.control.store import MetaServerClient
-from shardfly.integrations.metadata.inference import InferParamMetaResolver
-from shardfly.integrations.models.registry import get_infer_weights_converter
-from shardfly.integrations.sharding import get_rank_info_extractor
-from shardfly.metadata.resolver import ParameterMeta
+from shardfly.metadata.capture import (
+    build_captured_parameters_meta,
+    validate_captured_weights,
+)
+from shardfly.metadata.parameter import ParameterMeta, RankInfo
+from shardfly.plan import (
+    TransferPlanBuilder,
+    compute_transfer_plan_hash,
+    compute_transfer_plan_stats,
+)
+from shardfly.profiling.telemetry import emit_profile, profile_phase
 
 logger = logging.getLogger(__name__)
 
 
-def derive_expected_pp_ranks(
-    infer_params_meta: Sequence[ParameterMeta], local_engine_rank: int
-) -> List[int]:
-    pp_ranks = set()
-    for param in infer_params_meta:
-        for shard in param.shards:
-            if shard.engine_rank == local_engine_rank:
-                pp_ranks.add(shard.pp_rank)
-    if not pp_ranks:
-        raise ValueError(
-            f"No infer shards found for engine_rank={local_engine_rank}; cannot derive expected_pp_ranks"
+def get_vllm_rank_info(model_context, engine_rank) -> RankInfo:
+    tp_size = model_context["tp_size"]
+    tp_rank = model_context["tp_rank"]
+    dp_size = model_context["dp_size"]
+    dp_rank = model_context["dp_rank"]
+    ep_size = model_context.get("ep_size", 1)
+    ep_rank = model_context.get("ep_rank", 0)
+    # vLLM expert parallel groups are initialized independently of TP.
+    # Use explicit ep_tp_size/ep_tp_rank when provided; otherwise treat EP as a
+    # standalone dimension (ep_tp_size=1) to avoid tp_size < ep_size issues.
+    ep_tp_size = model_context.get("ep_tp_size", 1)
+    ep_tp_rank = model_context.get("ep_tp_rank", 0)
+    if ep_size <= 1:
+        ep_rank = 0
+        ep_tp_size = 1
+        ep_tp_rank = 0
+    cp_size = int(model_context.get("cp_size", 1) or 1)
+    cp_rank = int(model_context.get("cp_rank", 0) or 0)
+    cp_mode = model_context.get("cp_mode")
+    if not cp_mode:
+        cp_mode = "ring" if cp_size > 1 else "none"
+    return RankInfo(
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        pp_rank=model_context["pp_rank"],
+        pp_size=model_context["pp_size"],
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        ep_tp_rank=ep_tp_rank,
+        ep_tp_size=ep_tp_size,
+        attn_tp_rank=model_context["attn_tp_rank"],
+        attn_tp_size=model_context["attn_tp_size"],
+        attn_dp_rank=model_context["attn_dp_rank"],
+        world_size=model_context["world_size"],
+        global_rank=model_context["global_rank"],
+        engine_rank=engine_rank,
+        local_rank=model_context["local_rank"],
+        is_infer=True,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        cp_mode=cp_mode,
+    )
+
+
+class InferParamMetaResolver:
+    def __init__(self, inference_engine, engine_rank=0):
+        workers = inference_engine.execute_task_in_model_worker(
+            self._get_model_param_info, engine_rank=engine_rank
         )
-    return sorted(pp_ranks)
+        for worker in workers:
+            if isinstance(worker["rank_info"], dict):
+                worker["rank_info"] = RankInfo(**worker["rank_info"])
+        self._params_meta = build_captured_parameters_meta(workers)
+
+    def get_parameters_meta(self):
+        return self._params_meta
+
+    @staticmethod
+    def _get_model_param_info(engine_rank=0, **kwargs):
+        model = kwargs["model"]
+        return {
+            "rank_info": get_vllm_rank_info(kwargs["model_context"], engine_rank),
+            "params_meta": capture_inference(model).snapshot().shards,
+        }
 
 
-class WeightExchangeReader(ABC):
-    def __init__(self, inference_engine):
-        self.inference_engine = inference_engine
-        self.infer_config = inference_engine.config
-        self.weights_comm_nccl_group_size = (
-            self.infer_config.weights_comm_nccl_group_size
-        )
-
-    @abstractmethod
-    def initialize(self, **kwargs):
-        """Initialize the weight exchange reader."""
-        pass
-
-    @abstractmethod
-    def update_weights(self, step_id, **kwargs):
-        pass
-
-
-class WeightsReader(WeightExchangeReader):
+class WeightsReader:
     parameters_meta: List[ParameterMeta]
 
     def __init__(self, inference_engine, meta_resolver: InferParamMetaResolver = None):
-        super().__init__(inference_engine)
-        self.infer_engine_config = self.inference_engine.config
+        self.inference_engine = inference_engine
+        self.infer_engine_config = inference_engine.config
+        self.weights_comm_nccl_group_size = self.infer_engine_config.weights_comm_nccl_group_size
         if meta_resolver is None:
             meta_resolver = InferParamMetaResolver(
                 inference_engine,
-                num_engines=inference_engine.num_engines,
                 engine_rank=inference_engine.engine_rank,
-                convert_params=True,
             )
         self.meta_resolver = meta_resolver
         self.parameters_meta = []
-        self.hf_config = inference_engine.hf_config
         config = inference_engine.config
-        self.model_arch_name = meta_resolver.get_model_arch_name()
         self.meta_server_addr = config.meta_server_addr
         logger.info(f"Meta server address: {self.meta_server_addr}")
         self.meta_server_client = MetaServerClient(*self.meta_server_addr.split(":"))
         self.num_engines = config.num_engines
         logger.info("Put number of inference engines to meta server")
         self.engine_rank = self.inference_engine.engine_rank
-        self.tp_size = config.tp_size
-        self.pp_size = config.pp_size
-        self.dp_size = max(1, int(getattr(config, "dp_size", 1) or 1))
-        self.infer_world_size = (
-            self.num_engines * self.tp_size * self.pp_size * self.dp_size
-        )
+        self.infer_instance_world_size = meta_resolver.get_parameters_meta()[0].shards[0].world_size
+        self.infer_world_size = self.num_engines * self.infer_instance_world_size
         self.validated_steps = 0
         self.start_step = -1
         self.weights_validation_steps = config.weights_validation_steps
@@ -125,10 +162,6 @@ class WeightsReader(WeightExchangeReader):
         self.timeout = 10000
         self.lock = threading.Lock()
         self.initialized = False
-        self.expected_pp_ranks: List[int] = []
-        logger.info(
-            f"DP rank id: {self.engine_rank}, num_engines: {self.num_engines}, engine_rank: {self.engine_rank}, infer_world_size: {self.infer_world_size}, tp={self.tp_size}, pp={self.pp_size}, dp={self.dp_size}"
-        )
 
     def initialize(self, **kwargs):
         self.meta_server_client.put_object("num_infer_engines", self.num_engines)
@@ -144,42 +177,20 @@ class WeightsReader(WeightExchangeReader):
         logger.info(
             "Finished querying and building parameters meta from all tp workers"
         )
-        self.expected_pp_ranks = derive_expected_pp_ranks(
-            self.parameters_meta, self.engine_rank
-        )
-        logger.info(
-            "Derived expected_pp_ranks for engine %s: %s",
-            self.engine_rank,
-            self.expected_pp_ranks,
-        )
-        self.infer_conf = {
-            "engine_name": self.inference_engine.engine_name,
-            "infer_atten_tp_size": self.meta_resolver.rank0_info.attn_tp_size,
-            "router_dtype": getattr(self.hf_config, "router_dtype", "bf16"),
-            "infer_engine_config": self.infer_engine_config,
-            "hf_config": simple_hf_config(self.hf_config),
-            "infer_world_size": self.infer_world_size,
-            "expected_pp_ranks": self.expected_pp_ranks,
-            "device_backend": device_util.get_device_type(),
-        }
-        if self.model_arch_name == "Glm4MoeLiteForCausalLM":
-            # The draft may share embedding/head storage with the main model.
-            # Publish only distinct targets discovered from its actual weights.
-            self.infer_conf["mtp_alias_targets"] = [
-                parameter.name
-                for parameter in self.parameters_meta
-                if parameter.name.startswith("model.layers.")
-                and parameter.name.endswith(
-                    ("embed_tokens.weight", "shared_head.head.weight")
-                )
-            ]
-        self.meta_server_client.put_object("infer_conf", self.infer_conf)
-        logger.info(f"Put inference config {self.infer_conf} to meta server")
         if self.engine_rank == 0:
             self.meta_server_client.put_object(
                 "infer_params_meta", self.parameters_meta
             )
             logger.info("Put inference parameters meta to meta server")
+        else:
+            reference = self.meta_server_client.get_object(
+                "infer_params_meta", timeout=self.timeout
+            )
+            if self.parameters_meta != [
+                parameter.fast_copy_with_engine_rank(self.engine_rank)
+                for parameter in reference
+            ]:
+                raise ValueError("Captured inference shard layouts differ across engines")
         logger.info(
             f"Start to get training parameters meta from meta server for engine rank {self.engine_rank}"
         )
@@ -189,18 +200,12 @@ class WeightsReader(WeightExchangeReader):
         logger.info("Finished getting training parameters meta from meta server")
         self.training_world_size = self.training_params_meta[0].shards[0].world_size
         config = self.inference_engine.config
-        check_train_infer_params_meta(
-            self.training_params_meta,
-            self.parameters_meta,
-            raise_exception=not config.enable_debug_mode,
-        )
+        validate_captured_weights(self.training_params_meta, self.parameters_meta)
         logger.info("Start to send parameters meta to tp workers")
         infer_parameters_meta_bytes = pickle.dumps(self.parameters_meta)
         train_parameters_meta_bytes = pickle.dumps(self.training_params_meta)
-        infer_conf_bytes = pickle.dumps(self.infer_conf)
         self._preparation_results = self.inference_engine.execute_task_in_model_worker(
             self._init_in_tp_worker,
-            infer_conf_bytes=infer_conf_bytes,
             parameters_meta_bytes=infer_parameters_meta_bytes,
             training_params_meta_bytes=train_parameters_meta_bytes,
             engine_rank=self.engine_rank,
@@ -219,7 +224,6 @@ class WeightsReader(WeightExchangeReader):
 
     @staticmethod
     def _init_in_tp_worker(
-        infer_conf_bytes: bytes,
         parameters_meta_bytes: bytes,
         training_params_meta_bytes: bytes,
         engine_rank: int,
@@ -234,7 +238,6 @@ class WeightsReader(WeightExchangeReader):
         model = kwargs["model"]
         model_context = kwargs["model_context"]
         scheduler = model_context["scheduler"]
-        infer_conf = pickle.loads(infer_conf_bytes)
         parameters_meta = pickle.loads(parameters_meta_bytes)
         training_params_meta = pickle.loads(training_params_meta_bytes)
         infer_engine_config = model_context.get("infer_engine_config")
@@ -243,14 +246,9 @@ class WeightsReader(WeightExchangeReader):
                 infer_engine_config["comm_backend"] = weights_comm_backend
             else:
                 infer_engine_config.comm_backend = weights_comm_backend
-        from shardfly.integrations.reader.worker import TransportWorkerReader
-
-        cls = TransportWorkerReader
-        scheduler.shardfly_weights_reader = cls(
-            engine_name=infer_conf.get("engine_name", "vllm"),
+        scheduler.shardfly_weights_reader = TransportWorkerReader(
             model=model,
             model_context=model_context,
-            infer_conf=infer_conf,
             engine_rank=engine_rank,
             num_engines=num_engines,
             meta_server_addr=meta_server_addr,
@@ -286,7 +284,7 @@ class WeightsReader(WeightExchangeReader):
                 raise ValueError("Model readers require a changed surviving cohort")
             self.num_engines = engines
             self.infer_engine_config.num_engines = engines
-            self.infer_world_size = engines * self.tp_size * self.pp_size * self.dp_size
+            self.infer_world_size = engines * self.infer_instance_world_size
             if not self.initialized:
                 self._pending_membership = specification
                 self._initialize()
@@ -374,14 +372,14 @@ class WeightsReader(WeightExchangeReader):
         scheduler._asystem_copied_parameters = {}
         for name, param in model.named_parameters():
             scheduler._asystem_copied_parameters[name] = (
-                param.detach().cpu().contiguous()
+                param.detach().to(device="cpu", copy=True).contiguous()
             )
         logger.info(
             f"Finished copying parameters for step {step_id} for consistency check"
         )
-        for name, param in model.named_parameters():
-            param.data.fill_(0)
-            logger.debug(f"Set parameter {name} to 0")
+        with torch.inference_mode():
+            for tensor in scheduler.shardfly_weights_reader.parameters.values():
+                tensor.zero_()
         device_util.synchronize()
 
     def _validate_weights(
@@ -518,10 +516,8 @@ class WeightsReader(WeightExchangeReader):
 class WorkerWeightsReader:
     def __init__(
         self,
-        engine_name,
         model,
         model_context,
-        infer_conf,
         engine_rank,
         num_engines,
         meta_server_addr: str,
@@ -532,12 +528,8 @@ class WorkerWeightsReader:
         disable_pipeline: bool = False,
         weights_comm_nccl_group_size: int = None,
     ):
-        self.engine_name = engine_name
         self.model = model
         self.model_context = model_context
-        self.infer_conf = infer_conf
-        self.hf_config = infer_conf["hf_config"]
-        self.model_arch_name = self.hf_config.architectures[0]
         self.scheduler = model_context["scheduler"]
         self.infer_engine_config = model_context["infer_engine_config"]
         self.comm_backend = getattr(self.infer_engine_config, "comm_backend", "nccl")
@@ -557,9 +549,7 @@ class WorkerWeightsReader:
         self.infer_instance_world_size = parameters_meta[0].shards[0].world_size
         self.infer_world_size = num_engines * self.infer_instance_world_size
         self.transfer_world_size = self.training_world_size + self.infer_world_size
-        self.rank_info = get_rank_info_extractor(engine_name)(
-            model_context, engine_rank
-        )
+        self.rank_info = get_vllm_rank_info(model_context, engine_rank)
         logger.info(f"Reader rank info: {self.rank_info}")
         self.transfer_rank = (
             +self.engine_rank * self.infer_instance_world_size
@@ -567,13 +557,7 @@ class WorkerWeightsReader:
         )
         self.meta_server_addr = meta_server_addr
         self.meta_server_client = MetaServerClient(*self.meta_server_addr.split(":"))
-        self.weight_converter = get_infer_weights_converter(
-            self.engine_name,
-            self.model_arch_name,
-            hf_config=self.model.config,
-            infer_engine_config=self.infer_engine_config,
-            rank_info=self.rank_info,
-        )
+        self.capture = capture_inference(model)
         self.current_worker_parameters_meta = [
             p.to_local_parameter_meta(self.rank_info.global_rank)
             for p in self.parameters_meta
@@ -605,23 +589,7 @@ class WorkerWeightsReader:
         )
 
     def initialize(self):
-        self.parameters = {
-            hf_name: hf_param
-            for (name, param) in self.model.named_parameters()
-            for (hf_name, hf_param) in self.weight_converter.convert_param(name, param)
-        }
-        if (
-            getattr(self.hf_config, "tie_word_embeddings", False)
-            and self.rank_info.pp_rank == self.rank_info.pp_size - 1
-            and ("lm_head.weight" not in self.parameters)
-            and ("model.embed_tokens.weight" in self.parameters)
-        ):
-            self.parameters["lm_head.weight"] = self.parameters[
-                "model.embed_tokens.weight"
-            ]
-            logger.info(
-                "WeightsReader: added lm_head.weight alias for tied embeddings."
-            )
+        self.parameters = self.capture.snapshot().tensors
 
     def update_weights(self, step_id, **kwargs):
         start_time = time.perf_counter()
@@ -632,9 +600,6 @@ class WorkerWeightsReader:
         ) * 1000.0
         update_body_start = time.perf_counter()
         self._update_weights(step_id, **kwargs)
-        post_update = getattr(self.weight_converter, "post_update", None)
-        if callable(post_update):
-            post_update(self.model)
         update_body_time_ms = (time.perf_counter() - update_body_start) * 1000.0
         logger.info(
             f"Start to flush cache for step {step_id} for rank {self.transfer_rank}"
@@ -676,30 +641,262 @@ class WorkerWeightsReader:
         )
 
     def _update_weights(self, step_id, **kwargs):
-        logger.info(
-            f"Start to update weights for step {step_id} for rank {self.engine_rank}-{self.rank_info.global_rank}"
+        raise NotImplementedError
+
+
+
+class TransportWorkerReader(WorkerWeightsReader):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.transfer_plan = None
+        self.weights_update_group = None
+        self.send_ranks = None
+        self.send_ranks_sample = None
+        self.num_to_recvs = None
+        self.rank_coordinate = None
+        self.device_transport = None
+
+    def initialize(self):
+        super().initialize()
+        plan_builder = TransferPlanBuilder(
+            self.infer_world_size,
+            self.training_world_size,
+            self.num_engines,
+            self.enable_debug_mode,
         )
-        tensor_pairs = []
-        for parameter_meta in self.current_worker_parameters_meta:
-            name = parameter_meta.name
-            parameter = self.parameters[name]
-            if len(parameter_meta.shards) != 1:
-                raise ValueError(f"Current shard is None for parameter: {name}")
-            tensor_pairs.append(
-                (name, parameter, parameter_meta.shards[0], parameter_meta)
+        self.transfer_plan = plan_builder.build_local_transfer_plan(
+            self.parameters_meta, self.training_params_meta, self.transfer_rank
+        )
+        inter_hash = compute_transfer_plan_hash(self.transfer_plan)
+        logger.info(
+            "Reader rank %s inter plan hash: %s", self.transfer_rank, inter_hash
+        )
+        logger.info(
+            "Reader rank %s transfer plan stats: %s",
+            self.transfer_rank,
+            compute_transfer_plan_stats(self.transfer_plan),
+        )
+        if self.transfer_rank == 0:
+            master_address = get_ip_address()
+            master_port = get_free_port()
+            master_info = (master_address, master_port)
+            self.meta_server_client.put_object("master_info", master_info)
+            logger.info(
+                f"Put master info to meta server for rank {self.transfer_rank}: {master_info}"
             )
-        self.read_tensors(step_id, tensor_pairs, **kwargs)
-        self.finish_step(step_id)
+        else:
+            master_info = self.meta_server_client.get_object(
+                "master_info", timeout=self.timeout
+            )
+            (master_address, master_port) = master_info
+            logger.info(
+                f"Get master info from meta server for rank {self.transfer_rank}: {master_info}"
+            )
         logger.info(
-            f"Finished updating weights for step {step_id} for rank {self.engine_rank}-{self.rank_info.global_rank}"
+            f"Start to initialize NCCL weights writer for rank {self.transfer_rank}"
+        )
+        self.master_address = master_address
+        self.master_port = master_port
+        self.world_size = self.transfer_world_size
+        self._set_device()
+        self._init_weights_exchange_process_group()
+        self._shake_hands_with_writer()
+        from shardfly.transport import Transport
+
+        self.device_transport = Transport(
+            self.weights_update_group,
+            self.transfer_rank,
+            self.world_size,
+            infer_instance_world_size=self.infer_instance_world_size,
+            num_infer_engines=self.num_engines,
+        )
+        self.device_transport.resolve_rollout_topology()
+        self.device_transport.prepare_recv(self.parameters, self.transfer_plan)
+        self.send_ranks = list(self.transfer_plan.operations.keys())
+        self.send_ranks_sample = (
+            self.send_ranks[:8] + ["..."] + self.send_ranks[-8:]
+            if len(self.send_ranks) > 16
+            else self.send_ranks
+        )
+        self.num_to_recvs = sum(
+            (len(operations) for operations in self.transfer_plan.operations.values())
+        )
+        self.rank_coordinate = (
+            f"{self.engine_rank}-{self.rank_info.global_rank}-{self.transfer_rank}"
+        )
+        logger.info(
+            f"Created NCCL weights reader for rank {self.rank_info.global_rank}, engine rank {self.engine_rank}"
         )
 
-    def finish_step(self, step_id):
-        pass
+    def _shake_hands_with_writer(self):
+        from shardfly._utils.process_group import setup_batch_isend_irecv
 
-    def read_tensors(self, step_id: int, tensor_pairs: List, **kwargs):
-        pass
+        if self.transfer_rank == 0:
+            logger.info(
+                f"Start to test NCCL ready for rank {self.transfer_rank}, world size {self.transfer_world_size}"
+            )
+            dist.recv(
+                self.ready_tensor,
+                src=self.world_size - 1,
+                group=self.weights_update_group,
+            )
+            logger.info(
+                f"NCCL ready: recv tensor from rank 0 for rank {self.transfer_rank}"
+            )
+        setup_batch_isend_irecv(
+            self.weights_update_group, self.transfer_rank, self.world_size
+        )
 
+    def _set_device(self):
+        gpu_id = getattr(self.scheduler, "gpu_id", None) or getattr(
+            self.scheduler, "local_rank", None
+        )
+        if gpu_id is None:
+            gpu_id = int(os.environ.get("LOCAL_RANK", 0))
+        device_type = device_util.get_device_type()
+        device_count = device_util.device_count() or 1
+        if device_type == "cuda":
+            prev_device = torch.cuda.current_device()
+            logger.info(
+                f"[NCCLWeightsReader] Set device to {gpu_id} for rank {self.transfer_rank}, device env is {os.environ.get('DEVICE')}, previous device is {prev_device}, device_count is {device_count}, CUDA_VISIBLE_DEVICES env is {os.environ.get('CUDA_VISIBLE_DEVICES')}"
+            )
+            torch.cuda.set_device(gpu_id)
+            self.barrier_device = torch.cuda.current_device()
+            self.backend = "nccl"
+            self.ready_tensor = torch.tensor(1).cuda()
+        else:
+            logger.info(
+                f"[NCCLWeightsReader] Set device to {gpu_id} for rank {self.transfer_rank}, device env is {os.environ.get('DEVICE')}, previous device is {device_util.current_device()}, device_count is {device_count}, {'/'.join(device_util.visible_devices_env_names())} env is {device_util.visible_devices_env_value() or '(unset)'}"
+            )
+            device_util.set_device(gpu_id)
+            self.barrier_device = device_util.current_device()
+            self.backend = self.comm_backend
+            self.ready_tensor = torch.tensor(1, device=device_util.get_torch_device())
 
-def get_weights_exchange_reader(inference_engine) -> WeightExchangeReader:
-    return WeightsReader(inference_engine)
+    def _init_weights_exchange_process_group(self):
+        if self.already_initialized:
+            return
+        from shardfly._utils.process_group import init_weights_update_group
+
+        self.weights_update_group = init_weights_update_group(
+            master_address=self.master_address,
+            master_port=self.master_port,
+            rank=self.transfer_rank,
+            world_size=self.world_size,
+            group_name="weights_exchange",
+            backend="nccl",
+            role="inference",
+        )
+        logger.info(
+            f"Initialized NCCL weights reader for rank {self.transfer_rank}, engine rank {self.engine_rank}"
+        )
+        dist.barrier(group=self.weights_update_group, device_ids=[self.barrier_device])
+        logger.info(f"Barrier passed for weights reader with rank {self.transfer_rank}")
+        self.already_initialized = True
+
+    @torch.inference_mode()
+    def _update_weights(self, step_id, **kwargs):
+        """
+        Asynchronously receive weights from training ranks using torch.distributed.irecv.
+
+        This method implements a pipelined approach where:
+        1. For each sender rank, we maintain a queue of operations to receive
+        2. We start irecv operations in parallel from all sender ranks
+        3. When a receive completes, we immediately start the next receive from that rank
+        4. We continue until all operations from all sender ranks are completed
+
+        Args:
+            step_id: The training step ID
+            **kwargs: Additional keyword arguments (unused)
+        """
+        logger.info(
+            f"Start to update weights using NCCL for step {step_id} from {len(self.transfer_plan.operations)} ranks({self.send_ranks_sample}) for rank {self.rank_coordinate}."
+        )
+        self._init_weights_exchange_process_group()
+        start_time = time.perf_counter()
+        profile_metrics = {
+            "build_batch_time_ms": 0.0,
+            "metadata_upload_time_ms": 0.0,
+            "kernel_transfer_time_ms": 0.0,
+            "reader_wait_time_ms": 0.0,
+            "reader_copyback_time_ms": 0.0,
+            "payload_bytes": 0.0,
+        }
+        logger.info("Reader: submitting device task batch")
+        sync_start_barrier_time_ms = 0.0
+        if os.environ.get("SHARDFLY_PROFILE_SYNC_START", "0") == "1":
+            sync_start = time.perf_counter()
+            dist.barrier(
+                group=self.weights_update_group,
+                device_ids=[device_util.current_device()],
+            )
+            sync_start_barrier_time_ms = (time.perf_counter() - sync_start) * 1000.0
+        backend_execute_start = time.perf_counter()
+        profile_metrics.update(
+            self.device_transport.recv(self.parameters, self.transfer_plan, step_id)
+        )
+        self.capture.refresh()
+        device_util.synchronize(device_id=device_util.current_device())
+        profile_metrics["backend_execute_time_ms"] = (
+            time.perf_counter() - backend_execute_start
+        ) * 1000.0
+        duration = time.perf_counter() - start_time
+        logger.info(
+            f"Finished receiving weights for step {step_id} using NCCL from {len(self.transfer_plan.operations)} ranks({self.send_ranks_sample}) to rank {self.rank_coordinate} with {self.num_to_recvs} receives, took {duration:.4f} seconds"
+        )
+        compute_statistics(
+            self._history_update_weights_time,
+            step_id,
+            duration,
+            "Receive weights using NCCL",
+        )
+        completion_barrier_start = time.perf_counter()
+        dist.barrier(
+            group=self.weights_update_group, device_ids=[device_util.current_device()]
+        )
+        completion_barrier_time_ms = (
+            time.perf_counter() - completion_barrier_start
+        ) * 1000.0
+        logger.info(
+            f"Barrier passed for reader step {step_id} with rank {self.transfer_rank}"
+        )
+        kernel_transfer_time_ms = profile_metrics.get("kernel_transfer_time_ms", 0.0)
+        effective_gbps = 0.0
+        if kernel_transfer_time_ms > 0:
+            effective_gbps = profile_metrics.get("payload_bytes", 0.0) / (
+                kernel_transfer_time_ms * 1000000.0
+            )
+        backend_execute_time_ms = profile_metrics.get("backend_execute_time_ms", 0.0)
+        backend_effective_gbps = 0.0
+        if backend_execute_time_ms > 0:
+            backend_effective_gbps = profile_metrics.get("payload_bytes", 0.0) / (
+                backend_execute_time_ms * 1000000.0
+            )
+        self.last_transfer_metrics = dict(profile_metrics)
+        emit_profile(
+            logger,
+            event="weight_transfer",
+            role="reader",
+            backend=self.comm_backend,
+            phase=profile_phase(step_id),
+            step_id=int(step_id),
+            rank=int(self.transfer_rank),
+            sync_start_barrier_time_ms=sync_start_barrier_time_ms,
+            completion_barrier_time_ms=completion_barrier_time_ms,
+            total_transfer_time_ms=duration * 1000.0,
+            effective_gbps=effective_gbps,
+            backend_effective_gbps=backend_effective_gbps,
+            **profile_metrics,
+        )
+        emit_profile(
+            logger,
+            event="weight_transfer_cleanup",
+            role="reader",
+            backend=self.comm_backend,
+            phase=profile_phase(step_id),
+            step_id=int(step_id),
+            rank=int(self.transfer_rank),
+            resource_cleanup_time_ms=0.0,
+            gc_collect_time_ms=0.0,
+            gc_collect_skipped=True,
+        )

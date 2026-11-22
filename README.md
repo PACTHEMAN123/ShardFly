@@ -109,6 +109,21 @@ Model converters live in `python/shardfly/integrations/models/`. Workers are
 patched by `python/shardfly/integrations/vllm/plugin.py`, including spawned DP
 workers through `worker_extension.py`.
 
+### Loader capture
+
+With the ShardFly plugin enabled, vLLM's default loader captures the native
+weight layout while loading the checkpoint. Megatron Bridge supplies the
+training-side shard layout. Repeated updates use the prepared transfer schedule.
+
+| Parallelism | Megatron training | vLLM rollout |
+| --- | --- | --- |
+| Tensor parallelism (TP) | ✅ | ✅ |
+| Expert parallelism (EP) | ✅ | ✅ |
+| Pipeline parallelism (PP) | ✅ | ✅ |
+| Context parallelism (CP) | ✅ | ✅ |
+| Data parallelism (DP) | ✅ | ✅ |
+| Fully sharded data parallelism (FSDP) | ✅ | ❌ |
+
 ## veRL adapter
 
 `python/shardfly/integrations/verl/` provides a checkpoint-engine adapter and

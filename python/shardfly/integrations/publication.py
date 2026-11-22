@@ -1,10 +1,18 @@
-"""Run veRL's installed checkpoint engines against real Megatron/vLLM models.
+# Copyright 2026 ShardFly contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-The bucket packing, NCCL broadcast and RDMA ring are the original veRL code.
-Only lifecycle/HTTP plumbing is supplied here. Multiprocess vLLM workers use
-Ray's original NCCLGroup directly because Ray's actor-only API guard rejects
-these processes. Rendezvous keys address one local GPU per publication rank.
-"""
+"""Publication harness and native checkpoint benchmark backends."""
 
 import asyncio
 import base64
@@ -12,27 +20,220 @@ import importlib
 import inspect
 import multiprocessing
 import os
-from pathlib import Path
 import pickle
 import threading
 import time
 import uuid
-from contextlib import nullcontext
+from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Dict, Type
 
-import requests
 import torch
 
 from shardfly import logging
-from shardfly.integrations.publication.registry import (
-    PublicationMechanism, publication_endpoints,
-    register_publication_mechanism, register_vllm_publication_receiver,
-)
 
 logger = logging.getLogger(__name__)
 
 
+class PublicationMechanism(ABC):
+    """Training-side lifecycle used by the publication harness."""
+
+    uses_shardfly_meta_server = False
+    training_engine_backend = "file"
+
+    def __init__(self, harness, **kwargs):
+        self.harness = harness
+
+    def initialize_training(self) -> None:
+        """Initialize state shared by all training ranks."""
+        return None
+
+    def initialize_driver(self) -> None:
+        """Initialize transport state after the inference server is healthy."""
+        return None
+
+    @abstractmethod
+    def publish(self) -> None:
+        """Publish the current training weights to the inference workers."""
+
+    def close(self) -> None:
+        """Release mechanism-owned resources before the server exits."""
+        return None
+
+
+def publication_endpoints(harness):
+    endpoint_factory = getattr(harness, "publication_endpoints", None)
+    if callable(endpoint_factory):
+        return endpoint_factory()
+    return [
+        (
+            int(harness.inference_config.get("engine_rank", 0)),
+            harness.host,
+            harness.port,
+        )
+    ]
+
+
+_MECHANISMS: Dict[str, Type[PublicationMechanism]] = {}
+_VLLM_RECEIVERS = {}
+
+
+def register_publication_mechanism(name: str):
+    def decorator(cls: Type[PublicationMechanism]):
+        if name in _MECHANISMS:
+            raise ValueError(f"Publication mechanism already registered: {name}")
+        _MECHANISMS[name] = cls
+        cls.name = name
+        return cls
+
+    return decorator
+
+
+def register_vllm_publication_receiver(name: str):
+    def decorator(cls):
+        if name in _VLLM_RECEIVERS:
+            raise ValueError(f"vLLM publication receiver already registered: {name}")
+        _VLLM_RECEIVERS[name] = cls
+        return cls
+
+    return decorator
+
+
+def create_publication_mechanism(name: str, harness, **kwargs):
+    try:
+        mechanism_cls = _MECHANISMS[name]
+    except KeyError as exc:
+        choices = ", ".join(sorted(_MECHANISMS))
+        raise ValueError(
+            f"Unknown publication mechanism {name!r}; available: {choices}"
+        ) from exc
+    return mechanism_cls(harness, **kwargs)
+
+
+def publication_mechanism_names():
+    return tuple(sorted(_MECHANISMS))
+
+
+def create_vllm_publication_receiver(name: str, config: dict, worker_rank: int):
+    try:
+        receiver_cls = _VLLM_RECEIVERS[name]
+    except KeyError as exc:
+        choices = ", ".join(sorted(_VLLM_RECEIVERS))
+        raise ValueError(
+            f"No vLLM receiver for publication mechanism {name!r}; available: {choices}"
+        ) from exc
+    return receiver_cls(config, worker_rank)
+
+
+@register_publication_mechanism("shardfly")
+class ShardFlyPublicationMechanism(PublicationMechanism):
+    """Publication mechanism backed by the ShardFly transport."""
+
+    uses_shardfly_meta_server = True
+
+    def __init__(self, harness, **kwargs):
+        super().__init__(harness, **kwargs)
+        self.training_engine_backend = harness.comm_backend
+
+    def initialize_driver(self) -> None:
+        harness = self.harness
+        endpoints = publication_endpoints(harness)
+        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+            futures = [
+                executor.submit(self._initialize_endpoint, endpoint)
+                for endpoint in endpoints
+            ]
+            for future in futures:
+                future.result()
+
+    def _initialize_endpoint(self, endpoint) -> None:
+        import requests
+
+        (engine_rank, host, port) = endpoint
+        harness = self.harness
+        payload = {
+            "meta_server_addr": harness.meta_server_addr,
+            "engine_rank": engine_rank,
+            "num_engines": harness.inference_config["num_engines"],
+            "comm_backend": harness.inference_config["comm_backend"],
+            "enable_debug_mode": harness.inference_config["enable_debug_mode"],
+            "nnodes": 1,
+            "node_rank": 0,
+        }
+        if harness.validate:
+            payload["weights_validation_steps"] = getattr(
+                harness, "weights_validation_steps", 1
+            )
+            payload["validate_weights_every_n_steps"] = 1
+            if harness.inference_config.get("debug_mode_config"):
+                payload["debug_mode_config"] = harness.inference_config[
+                    "debug_mode_config"
+                ]
+            if harness.dump_weights_list_for_validation:
+                payload["dump_weights_list_for_validation"] = (
+                    harness.dump_weights_list_for_validation
+                )
+            if harness.dump_weights_dir_for_validation:
+                payload["dump_weights_dir_for_validation"] = (
+                    harness.dump_weights_dir_for_validation
+                )
+        response = requests.post(
+            f"http://{host}:{port}/shardfly_init", json=payload, timeout=60
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"ShardFly init failed for engine {engine_rank}: {response.text}"
+            )
+
+    def publish(self) -> None:
+        harness = self.harness
+        executor_context = (
+            ThreadPoolExecutor(max_workers=1)
+            if harness.is_driver
+            else nullcontext()
+        )
+        with executor_context as executor:
+            future = (
+                executor.submit(self._request_update, path=None)
+                if executor is not None
+                else None
+            )
+            harness._training_barrier()
+            harness.training_engine.write_weights()
+            if future is not None:
+                future.result()
+
+    def _request_update(self, path: str | None) -> None:
+        import requests
+
+        harness = self.harness
+        payload = {"step_id": harness.training_engine.global_step, "kwargs": {}}
+        if path is not None:
+            payload["kwargs"]["path"] = path
+        endpoints = publication_endpoints(harness)
+        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+            futures = [
+                executor.submit(
+                    requests.post,
+                    f"http://{host}:{port}/shardfly_update",
+                    json=payload,
+                    timeout=300,
+                )
+                for (_, host, port) in endpoints
+            ]
+            for endpoint, future in zip(endpoints, futures):
+                response = future.result()
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"ShardFly update failed for engine {endpoint[0]}: {response.text}"
+                    )
+
+
 def _request_endpoints(endpoints, route, payloads, timeout_seconds):
+    import requests
+
     # CuPy's blocking NCCL communicator constructor can hold the training
     # process's GIL. A persistent control process keeps HTTP requests progressing
     # while that constructor waits for the rollout ranks. Model tensors remain
@@ -172,19 +373,6 @@ def _new_engine(backend, config, master):
     return engine_class(**kwargs)
 
 
-def _load_one(model, name, weight):
-    if hasattr(model, "target") and hasattr(model, "draft"):
-        prefix = f"model.layers.{model.num_hidden_layers}."
-        if name.startswith(prefix):
-            aliases = {prefix + "embed_tokens.weight": "model.embed_tokens.weight",
-                       prefix + "shared_head.head.weight": "lm_head.weight"}
-            model.draft.load_weights([(aliases.get(name, name), weight)])
-        else:
-            model.target.load_weights([(name, weight)])
-    else:
-        model.load_weights([(name, weight)])
-
-
 def _load_fp8_weights(model_runner, weights):
     """Use veRL's quantizer and refit lifecycle with recyclable NCCL views.
 
@@ -207,7 +395,9 @@ def _load_fp8_weights(model_runner, weights):
             parameter.orig_type = parameter.__class__
             parameter.__class__ = parameter.subclass_type
     try:
-        from vllm.model_executor.model_loader.mtp_validation import disable_mtp_completeness_check
+        from vllm.model_executor.model_loader.mtp_validation import (
+            disable_mtp_completeness_check,
+        )
     except ImportError:
         disable_mtp_completeness_check = nullcontext
     try:
@@ -268,7 +458,6 @@ class NativeReceiver:
         count = total = 0
         receive_wait_ms = 0
         started = time.perf_counter()
-        architecture = model.config.architectures[0]
         generator = self.engine.receive_weights(global_steps=step_id)
         async def next_weight():
             return await generator.__anext__()
@@ -286,43 +475,23 @@ class NativeReceiver:
                 receive_wait_ms += (time.perf_counter() - wait_start) * 1000
                 count += 1
                 total += weight.numel() * weight.element_size()
-                if architecture == "GptOssForCausalLM" and name.endswith(
-                    (".down_proj_bias", ".down_proj.bias", ".w2_bias")
-                ):
-                    # vLLM zeros this loader input on nonzero TP ranks. Native
-                    # RDMA engines expose a bucket still being forwarded to
-                    # downstream workers, including later TP-rank-zero owners.
-                    # Keep that shared bucket immutable; only this small bias
-                    # tensor needs a private loader copy.
-                    weight = weight.clone()
-                if hasattr(model, "draft") and name.startswith(
-                    f"model.layers.{model.num_hidden_layers}."
-                ):
-                    _load_one(model, name, weight)
-                else:
-                    yield name, weight
-        # Consume each bucket view before advancing the native async iterator;
-        # keep vLLM's original loader initialized once for the full update.
-        target = getattr(model, "target", model)
+                # A loader may mutate its input while a downstream rank
+                # still reads the shared RDMA bucket.
+                yield name, weight.clone() if self.backend != "nccl" else weight
         if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED") == "1":
-            if self.backend != "nccl" or target is not model:
-                raise ValueError("Native FP8 benchmark requires NCCL and one target model")
+            if self.backend != "nccl":
+                raise ValueError("Native FP8 benchmark requires NCCL")
             _load_fp8_weights(self.model_runner, weights())
         else:
             with phase("loader_including_receive"):
-                target.load_weights(weights())
+                model.load_weights(weights())
         with phase("loader_final_sync"):
             torch.cuda.synchronize()
         receive_apply_ms = (time.perf_counter() - started) * 1000
-        post_started = time.perf_counter()
-        if architecture in ("Glm4MoeLiteForCausalLM", "DeepseekV3ForCausalLM"):
-            from shardfly.integrations.models.glm4_moe_lite import GLM47FlashVLLMWeightConverter
-            GLM47FlashVLLMWeightConverter.post_update(None, model)
-        torch.cuda.synchronize()
         return {"worker_rank": self.worker_rank, "received_tensors": count,
                 "payload_bytes": total, "receive_wait_ms": receive_wait_ms,
                 "load_apply_ms": receive_apply_ms - receive_wait_ms,
-                "postprocess_ms": (time.perf_counter() - post_started) * 1000,
+                "postprocess_ms": 0.0,
                 "receive_apply_ms": (time.perf_counter() - started) * 1000}
 
     def close(self):
@@ -412,6 +581,8 @@ class NativePublication(PublicationMechanism):
                             "receiver_groups": configured}
 
     def _requests_one(self, host, port, route, payload):
+        import requests
+
         response = requests.post(f"http://{host}:{port}/{route}", json=payload,
                                  timeout=self.timeout_seconds)
         if response.status_code != 200:

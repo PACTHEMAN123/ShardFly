@@ -16,15 +16,139 @@
 # Copyright the Awex developers, licensed under the Apache License, Version 2.0.
 
 
+"""vLLM server configuration, RPC adapters, and optional CLI entrypoint."""
+
 import asyncio
 import inspect
-from typing import Any, Dict, Optional
+import os
+import sys
+from dataclasses import dataclass, field
+from functools import cache
+from typing import Any, Dict, List, Optional
 
 from shardfly import logging
-from shardfly.integrations.config import InferenceConfig
-from shardfly.integrations.reader.base import get_weights_exchange_reader
 
 logger = logging.getLogger(__name__)
+
+
+class InferenceConfigValidationError(ValueError):
+    """Raised when InferenceConfig contains invalid or inconsistent settings."""
+
+    pass
+
+
+_VALID_COMM_BACKENDS: frozenset = frozenset({"transport"})
+
+
+@dataclass
+class InferenceConfig:
+    """
+    Configuration for inference.
+    """
+
+    model_path: Optional[str] = None
+    tp_size: Optional[int] = None
+    pp_size: Optional[int] = None
+    dp_size: Optional[int] = None
+    ep_size: Optional[int] = None
+    nnodes: Optional[int] = None
+    node_rank: Optional[int] = None
+    local_rank: Optional[int] = None
+    num_engines: int = 1
+    engine_rank: int = 0
+    meta_server_addr: Optional[str] = None
+    comm_backend: str = "transport"
+    weights_validation_steps: int = 0
+    validate_weights_every_n_steps: int = 1
+    dump_weights_list_for_validation: List[str] = field(default_factory=list)
+    dump_weights_dir_for_validation: Optional[str] = None
+    disable_weights_exchange_pipeline: bool = False
+    enable_debug_mode: bool = False
+    debug_mode_config: Dict = field(
+        default_factory=dict, metadata={"help": "Debug mode configuration"}
+    )
+    weights_comm_nccl_group_size: int = 1
+
+    def validate(self) -> None:
+        """Validate configuration fields for consistency and correctness.
+
+        Raises:
+            InferenceConfigValidationError: if any field is invalid or fields are inconsistent.
+        """
+        errors: List[str] = []
+        if self.comm_backend not in _VALID_COMM_BACKENDS:
+            errors.append(
+                f"comm_backend must be one of {sorted(_VALID_COMM_BACKENDS)}, got {self.comm_backend!r}"
+            )
+        if self.num_engines < 1:
+            errors.append(f"num_engines must be >= 1, got {self.num_engines}")
+        elif not 0 <= self.engine_rank < self.num_engines:
+            errors.append(
+                f"engine_rank must be in [0, num_engines), got engine_rank={self.engine_rank} with num_engines={self.num_engines}"
+            )
+        for name, val in [
+            ("tp_size", self.tp_size),
+            ("pp_size", self.pp_size),
+            ("dp_size", self.dp_size),
+            ("ep_size", self.ep_size),
+            ("weights_comm_nccl_group_size", self.weights_comm_nccl_group_size),
+        ]:
+            if val is not None and val < 1:
+                errors.append(f"{name} must be >= 1 when set, got {val}")
+        if self.nnodes is not None:
+            if self.nnodes < 1:
+                errors.append(f"nnodes must be >= 1 when set, got {self.nnodes}")
+            elif self.node_rank is not None and (not 0 <= self.node_rank < self.nnodes):
+                errors.append(
+                    f"node_rank must be in [0, nnodes), got node_rank={self.node_rank} with nnodes={self.nnodes}"
+                )
+        if self.validate_weights_every_n_steps < 1:
+            errors.append(
+                f"validate_weights_every_n_steps must be >= 1, got {self.validate_weights_every_n_steps}"
+            )
+        if self.weights_validation_steps < 0:
+            errors.append(
+                f"weights_validation_steps must be >= 0, got {self.weights_validation_steps}"
+            )
+        if self.dump_weights_list_for_validation and (
+            not self.dump_weights_dir_for_validation
+        ):
+            errors.append(
+                "dump_weights_dir_for_validation must be set when dump_weights_list_for_validation is non-empty"
+            )
+        if self.num_engines > 1 and (not self.meta_server_addr):
+            errors.append(
+                f"meta_server_addr must be set when num_engines > 1 and comm_backend is {self.comm_backend!r}"
+            )
+        if errors:
+            msg = "InferenceConfig validation failed:\n" + "\n".join(
+                (f"  - {e}" for e in errors)
+            )
+            raise InferenceConfigValidationError(msg)
+
+    def validated(self) -> "InferenceConfig":
+        """Call validate() and return self for easy chaining.
+
+        Example::
+
+            config = InferenceConfig.from_dict(d).validated()
+        """
+        self.validate()
+        return self
+
+    @staticmethod
+    def from_dict(
+        config_dict: Dict[str, Any], validate: bool = True
+    ) -> "InferenceConfig":
+        config_dict = {
+            k: v
+            for (k, v) in config_dict.items()
+            if k in InferenceConfig.__dataclass_fields__
+        }
+        cfg = InferenceConfig(**config_dict)
+        if validate:
+            cfg.validate()
+        return cfg
 
 
 class ShardFlyVLLMServerAdapter:
@@ -80,9 +204,6 @@ class ShardFlyVLLMServerAdapter:
             pp_size=parallel_config.pipeline_parallel_size,
             dp_size=parallel_config.data_parallel_size,
             ep_size=inferred_ep_size,
-            enable_dp_attention=False,
-            enable_dp_lm_head=False,
-            moe_dense_tp_size=None,
             nnodes=resolved_nnodes,
             node_rank=resolved_node_rank,
             num_engines=num_engines,
@@ -119,7 +240,9 @@ class ShardFlyVLLMServerAdapter:
             return
         self._initializing = True
         logger.info("Initializing ShardFly weights reader in vLLM server process.")
-        self.weights_exchange_reader = get_weights_exchange_reader(self)
+        from shardfly.integrations.reader import WeightsReader
+
+        self.weights_exchange_reader = WeightsReader(self)
         self.weights_exchange_reader.initialize()
         self._initialized = True
         self._initializing = False
@@ -279,3 +402,154 @@ class ShardFlyVLLMServerAdapter:
                 len(merged_results),
             )
         return merged_results
+
+
+class PublicationVLLMServerAdapter:
+    """Thin API-server adapter for mechanism-specific vLLM worker state."""
+
+    def __init__(self, engine_client, loop, timeout_seconds: int):
+        self._engine_client = engine_client
+        self._engine_core = engine_client.engine_core
+        self._loop = loop
+        self.timeout_seconds = timeout_seconds
+        self.mechanism = None
+        # Reuse the tested vLLM RPC plumbing without initializing any
+        # ShardFly transport, metadata, communicator, or weights reader.
+        self._rpc = ShardFlyVLLMServerAdapter.__new__(ShardFlyVLLMServerAdapter)
+        self._rpc._engine_client = engine_client
+        self._rpc._engine_core = self._engine_core
+        self._rpc._loop = loop
+
+    def initialize(self, mechanism: str, config: dict):
+        self.mechanism = mechanism
+        return self._collective_rpc(
+            "publication_init",
+            timeout=self.timeout_seconds,
+            args=(mechanism, config),
+        )
+
+    def update(self, step_id: int):
+        if self.mechanism is None:
+            raise RuntimeError("Publication adapter is not initialized")
+        result = self._collective_rpc(
+            "publication_update",
+            timeout=self.timeout_seconds,
+            args=(step_id,),
+        )
+        if self._rpc._call_engine_async("reset_prefix_cache") is False:
+            raise RuntimeError("vLLM prefix cache reset failed after publication")
+        if hasattr(self._engine_client, "reset_encoder_cache"):
+            self._rpc._call_engine_async("reset_encoder_cache")
+        return result
+
+    def configure(self, config: dict):
+        return self._collective_rpc(
+            "publication_configure", timeout=self.timeout_seconds, args=(config,)
+        )
+
+    def execute_task_in_model_worker(self, task, **kwargs):
+        return self._collective_rpc(
+            "shardfly_execute", timeout=self.timeout_seconds,
+            args=(task.__module__, task.__qualname__, kwargs),
+        )
+
+    def close(self):
+        if self.mechanism is None:
+            return []
+        try:
+            return self._collective_rpc(
+                "publication_close",
+                timeout=self.timeout_seconds,
+            )
+        finally:
+            self.mechanism = None
+
+    def _collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        cores = self._rpc._collective_rpc_all_dp_cores(
+            method, timeout=timeout, args=args, kwargs=kwargs
+        )
+        return [item for result in cores
+                for item in (result if isinstance(result, list) else [result])]
+
+
+def register_shardfly_plugin():
+    main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    if getattr(main_spec, "name", None) == "vllm.model_executor.models.registry":
+        return
+
+    from shardfly.integrations.loader_capture import register_capture_loader
+    from shardfly.integrations.vllm_plugin import register_shardfly_plugin as register
+
+    register_capture_loader()
+    register()
+
+
+@cache
+def _load_worker_extension():
+    # Spawned workers resolve the extension before constructing the model.
+    if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED") == "1":
+        from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
+
+        apply_vllm_quant_patches()
+
+    from shardfly.integrations.loader_capture import register_capture_loader
+    from shardfly.integrations.vllm_plugin import _patch_shardfly_worker
+
+    register_capture_loader()
+    _patch_shardfly_worker()
+    return _WorkerExtension
+
+
+class _WorkerExtension:
+    """Marker for vLLM's worker-extension loader."""
+
+
+def __getattr__(name):
+    if name == "ShardFlyWorkerExtension":
+        return _load_worker_extension()
+    raise AttributeError(name)
+
+
+def main():
+    register_shardfly_plugin()
+
+    import uvloop
+
+    try:
+        from vllm.entrypoints.launchers.api_server.entry import run_server
+        from vllm.entrypoints.launchers.cli_args import (
+            make_arg_parser,
+            validate_parsed_serve_args,
+        )
+    except ImportError:
+        from vllm.entrypoints.openai.api_server import run_server
+        from vllm.entrypoints.openai.cli_args import (
+            make_arg_parser,
+            validate_parsed_serve_args,
+        )
+
+    try:
+        from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
+    except ImportError:
+        from vllm.entrypoints.utils import cli_env_setup
+
+    try:
+        from vllm.utils import FlexibleArgumentParser
+    except ImportError:
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    cli_env_setup()
+    parser = FlexibleArgumentParser(
+        description="vLLM OpenAI-Compatible RESTful API server (ShardFly)."
+    )
+    args = make_arg_parser(parser).parse_args()
+    if not args.worker_extension_cls:
+        args.worker_extension_cls = "shardfly.integrations.vllm.ShardFlyWorkerExtension"
+    validate_parsed_serve_args(args)
+
+    logger.info("Starting vLLM server with ShardFly routes enabled")
+    uvloop.run(run_server(args))
+
+
+if __name__ == "__main__":
+    main()

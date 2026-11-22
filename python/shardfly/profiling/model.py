@@ -63,7 +63,7 @@ class ModelWeightProfile:
         torch.cuda.synchronize()
 
     def command(self, operation, version):
-        from shardfly.profiling.communication_memory import enabled, MemorySampler
+        from shardfly.profiling.communication_memory import MemorySampler, enabled
 
         memory = None
         if operation == "verify" and getattr(self, "memory_sampler", None) is not None:
@@ -172,17 +172,13 @@ def model_profile_task(operation: str, version: int, marker_mode="constant", mar
                 name: p.data_ptr() for name, p in kwargs["model"].named_parameters()
             }:
                 raise AssertionError("A native FP8 model parameter was replaced during bootstrap")
-            if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED") == "1":
-                profile = FP8ModelWeightProfile.from_vllm_checkpoint(
-                    kwargs["model"], kwargs["model_context"],
-                    os.environ["SHARDFLY_CHECKPOINT_PATH"], marker_mode, marker_period,
-                )
-            else:
-                profile = FP8ModelWeightProfile.from_checkpoint(
-                    reader,
-                    os.environ["SHARDFLY_CHECKPOINT_PATH"],
-                    marker_mode, marker_period,
-                )
+            if reader is None:
+                raise ValueError("FP8 checkpoint profiling requires captured shard metadata")
+            profile = FP8ModelWeightProfile.from_checkpoint(
+                reader,
+                os.environ["SHARDFLY_CHECKPOINT_PATH"],
+                marker_mode, marker_period,
+            )
         else:
             from shardfly.profiling.communication_memory import enabled, snapshot
             before_references = snapshot() if enabled() else None
