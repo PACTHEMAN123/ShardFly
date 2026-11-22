@@ -22,7 +22,6 @@ import pickle
 import socket
 import struct
 from enum import Enum
-from typing import List
 
 import torch
 
@@ -31,22 +30,18 @@ from shardfly import logging
 logger = logging.getLogger(__name__)
 
 
+def is_fused_fp8(source, target):
+    return (
+        os.environ.get("SHARDFLY_FP8_BLOCKWISE") == "1"
+        and source == torch.bfloat16
+        and target == torch.float8_e4m3fn
+    )
+
+
 def _is_allowed_infer_only_alias(
     extra_key: str, infer_keys: set[str], train_keys: set[str]
 ) -> bool:
-    """Return True when infer-only key is a known canonical alias.
-
-    Keep this list intentionally small to avoid silently accepting real mismatches.
-    Current supported alias:
-    - tied embeddings: lm_head.weight <-> model.embed_tokens.weight
-    """
-    if extra_key == "lm_head.weight":
-        return (
-            "model.embed_tokens.weight" in infer_keys
-            and "model.embed_tokens.weight" in train_keys
-        )
-    if extra_key == "model.embed_tokens.weight":
-        return "lm_head.weight" in infer_keys and "lm_head.weight" in train_keys
+    """Allow the scale tensor that transport generates for an FP8 destination."""
     if os.environ.get("SHARDFLY_FP8_BLOCKWISE", "0") == "1" and extra_key.endswith(
         ".weight_scale_inv"
     ):
@@ -151,88 +146,6 @@ def compute_statistics(stage_history: dict, step_id: int, duration: float, stage
     logger.info(
         f"{stage} time statistics for step {step_id}: average time: {avg_time:.4f} seconds, median time: {median_time:.4f} seconds, min time: {min_time:.4f} seconds,  max time: {max_time:.4f} seconds"
     )
-
-
-def check_train_infer_params_meta(
-    training_params_meta: List,
-    infer_parameters_meta: List,
-    raise_exception: bool = False,
-    strict_key_match: bool = False,
-):
-    infer_meta = {param_meta.name: param_meta for param_meta in infer_parameters_meta}
-    train_meta = {param_meta.name: param_meta for param_meta in training_params_meta}
-    infer_keys = set(infer_meta.keys())
-    train_keys = set(train_meta.keys())
-    common_params = infer_keys & train_keys
-    missing_on_infer = train_keys - infer_keys
-    extra_on_infer = infer_keys - train_keys
-    unsupported_extra_on_infer = {
-        key
-        for key in extra_on_infer
-        if not _is_allowed_infer_only_alias(key, infer_keys, train_keys)
-    }
-    if strict_key_match:
-        mismatched = bool(missing_on_infer or extra_on_infer)
-    else:
-        mismatched = bool(missing_on_infer or unsupported_extra_on_infer)
-    if mismatched:
-        logger.error(
-            "Inconsistent parameters meta keys: train=%s infer=%s missing_on_infer=%s extra_on_infer=%s unsupported_extra_on_infer=%s strict=%s",
-            len(train_meta),
-            len(infer_meta),
-            sorted(missing_on_infer),
-            sorted(extra_on_infer),
-            sorted(unsupported_extra_on_infer),
-            strict_key_match,
-        )
-        if raise_exception:
-            raise ValueError(
-                f"Inconsistent parameters meta keys: train={len(train_meta)} infer={len(infer_meta)} missing_on_infer={sorted(missing_on_infer)} extra_on_infer={sorted(extra_on_infer)} unsupported_extra_on_infer={sorted(unsupported_extra_on_infer)} strict={strict_key_match}"
-            )
-    elif extra_on_infer:
-        logger.info(
-            "Infer meta has extra keys not required by training (allowed alias subset), count=%s sample=%s",
-            len(extra_on_infer),
-            sorted(extra_on_infer)[:8],
-        )
-    for param_name in common_params:
-        infer_param_meta = infer_meta[param_name]
-        train_param_meta = train_meta[param_name]
-        if infer_param_meta.global_numel != train_param_meta.global_numel:
-            error_msg = f"Inconsistent number of elements for parameter {param_name}: {infer_param_meta.global_numel} != {train_param_meta.global_numel}"
-            if raise_exception:
-                raise ValueError(error_msg)
-            else:
-                logger.error(error_msg)
-        if infer_param_meta.global_shape != train_param_meta.global_shape:
-            error_msg = f"Inconsistent shape for parameter {param_name}: {infer_param_meta.global_shape} != {train_param_meta.global_shape}"
-            if raise_exception:
-                raise ValueError(error_msg)
-            else:
-                logger.error(error_msg)
-        fused_fp8 = (
-            os.environ.get("SHARDFLY_FP8_BLOCKWISE", "0") == "1"
-            and str(infer_param_meta.dtype).removeprefix("torch.") == "float8_e4m3fn"
-            and (str(train_param_meta.dtype).removeprefix("torch.") == "bfloat16")
-        )
-        if infer_param_meta.dtype != train_param_meta.dtype and (not fused_fp8):
-            error_msg = f"Inconsistent dtype for parameter {param_name}: {infer_param_meta.dtype} != {train_param_meta.dtype}"
-            if raise_exception:
-                raise ValueError(error_msg)
-            else:
-                logger.error(error_msg)
-        infer_tp_size = len(infer_param_meta.replicas[0].shards)
-        train_tp_size = len(train_param_meta.replicas[0].shards)
-        (max_tp, min_tp) = (
-            max(infer_tp_size, train_tp_size),
-            min(infer_tp_size, train_tp_size),
-        )
-        if max_tp % min_tp != 0:
-            error_msg = f"Inference for parameter {param_name} has wrong tp_size: infer {infer_tp_size} train {train_tp_size}"
-            if raise_exception:
-                raise ValueError(error_msg)
-            else:
-                logger.error(error_msg)
 
 
 def pretty_bytes(size_bytes):

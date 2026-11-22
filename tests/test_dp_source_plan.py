@@ -5,8 +5,12 @@ from collections import Counter
 import pytest
 import torch
 
-from shardfly.metadata.parameter import ParameterMeta, ParameterReplicaMeta, ParameterShardMeta
-from shardfly.metadata.sharding import ShardingType
+from shardfly.metadata.parameter import (
+    ParameterMeta,
+    ParameterReplicaMeta,
+    ParameterShardMeta,
+    ShardingType,
+)
 from shardfly.plan import TransferPlanBuilder
 
 

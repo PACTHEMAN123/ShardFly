@@ -20,12 +20,13 @@ from typing import Dict, List, Tuple
 
 import pytest
 import torch
-from shardfly.metadata.resolver import (
+
+from shardfly.metadata.parameter import (
     ParameterMeta,
     ParameterReplicaMeta,
     ParameterShardMeta,
+    ShardingType,
 )
-from shardfly.metadata.sharding import ShardingType
 from shardfly.plan import CommunicationOperation, TransferPlanBuilder
 
 

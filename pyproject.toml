@@ -16,7 +16,7 @@ dev = ["pytest", "ruff"]
 integrations = ["requests", "aiohttp", "transformers", "ray", "fastapi", "uvloop"]
 
 [project.entry-points."vllm.general_plugins"]
-shardfly_adapter = "shardfly.integrations.vllm.entrypoint:register_shardfly_plugin"
+shardfly_adapter = "shardfly.integrations.vllm:register_shardfly_plugin"
 
 [tool.scikit-build]
 wheel.packages = ["python/shardfly"]
@@ -30,6 +30,7 @@ testpaths = ["tests"]
 pythonpath = ["python"]
 
 [tool.ruff]
+src = ["python"]
 line-length = 88
 target-version = "py310"
 
@@ -40,5 +41,5 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 # NCCL preload and Ray locality must run before importing their consumers.
 "python/shardfly/transport.py" = ["E402"]
-"python/shardfly/integrations/vllm/plugin.py" = ["E402"]
-"python/shardfly/integrations/verl/checkpoint.py" = ["E402"]
+"python/shardfly/integrations/vllm_plugin.py" = ["E402"]
+"python/shardfly/integrations/verl.py" = ["E402"]

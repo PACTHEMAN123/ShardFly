@@ -24,15 +24,14 @@ from typing import Any
 import ray
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
 
-from shardfly.integrations.config import InferenceConfig
-from shardfly.integrations.verl.environment import configure_ray_locality
+from shardfly.integrations.vllm import InferenceConfig
+from shardfly.topology import configure_ray_locality
 
 configure_ray_locality()
+from shardfly.capture import capture_training
 from shardfly.control.store import start_meta_server
-from shardfly.integrations.engine.megatron import (
-    MegatronEngine as ShardFlyMegatronEngine,
-)
-from shardfly.integrations.reader.base import get_weights_exchange_reader
+from shardfly.integrations.engine import CapturedTrainingEngine
+from shardfly.integrations.reader import WeightsReader
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +69,6 @@ class _VerlVLLMInferenceEngine:
             pp_size=_config_int(rollout_config, "pipeline_model_parallel_size"),
             dp_size=_config_int(rollout_config, "data_parallel_size"),
             ep_size=_config_int(rollout_config, "expert_parallel_size"),
-            enable_dp_attention=False,
-            enable_dp_lm_head=False,
-            moe_dense_tp_size=None,
             nnodes=1,
             node_rank=0,
             num_engines=num_engines,
@@ -99,7 +95,7 @@ class _VerlVLLMInferenceEngine:
         return self._config.engine_rank
 
     def initialize(self) -> None:
-        self.weights_exchange_reader = get_weights_exchange_reader(self)
+        self.weights_exchange_reader = WeightsReader(self)
         self.weights_exchange_reader.initialize()
 
     def update_weights(self, step_id: int) -> None:
@@ -139,7 +135,7 @@ class _VerlVLLMInferenceEngine:
 
 
 class BaseCheckpointEngine(CheckpointEngine):
-    """Bridge veRL Megatron actors directly to ShardFly vLLM readers."""
+    """Publish captured veRL actors directly into captured vLLM workers."""
 
     requires_model_engine = True
     handles_receive = True
@@ -271,25 +267,16 @@ class BaseCheckpointEngine(CheckpointEngine):
         if global_steps is None:
             raise ValueError("ShardFly publication requires a global_steps version")
         if self._shardfly_training_engine is None:
-            try:
-                model = model_engine.module
-                hf_config = model_engine.model_config.hf_config
-            except AttributeError as exc:
-                raise TypeError(
-                    "ShardFly checkpoint backends require veRL's MegatronEngine"
-                ) from exc
-            self._shardfly_training_engine = ShardFlyMegatronEngine(
-                {
-                    "comm_backend": self.comm_backend,
-                    "meta_server_addr": self.meta_server_addr,
-                    "enable_debug_mode": self.enable_debug_mode,
-                    "debug_mode_config": self.debug_mode_config,
-                    "disable_weights_exchange_pipeline": self.disable_weights_exchange_pipeline,
-                },
-                hf_config,
-                model,
+            capture = capture_training(
+                model_engine.module,
+                state_dict=getattr(model_engine, "shardfly_state_dict", None),
             )
-            self._shardfly_training_engine.initialize()
+            self._shardfly_training_engine = CapturedTrainingEngine(
+                capture,
+                meta_server_addr=self.meta_server_addr,
+                comm_backend=self.comm_backend,
+                enable_debug_mode=self.enable_debug_mode,
+            )
         start = time.perf_counter()
         self._shardfly_training_engine.set_global_step(int(global_steps))
         self._shardfly_training_engine.write_weights()

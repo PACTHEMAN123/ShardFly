@@ -32,16 +32,14 @@ def _covers(shard, start, end):
 
 
 def _owners(meta):
-    # A physical owner appears only once, even when a resolver includes it in
-    # several replica views. Conflicting views of one parameter are invalid.
+    # A rank may bind several disjoint regions of one checkpoint weight.
     owners = {}
     for shard in meta.shards:
-        previous = owners.setdefault(int(shard.global_rank), shard)
-        if (previous.global_offset, previous.shape, previous.dtype) != (
-            shard.global_offset, shard.shape, shard.dtype
-        ):
+        key = (shard.global_rank, shard.global_offset, shard.shape)
+        previous = owners.setdefault(key, shard)
+        if previous.dtype != shard.dtype or previous.tensor_key != shard.tensor_key:
             raise ValueError(f"Conflicting physical ownership for {meta.name}")
-    return tuple(owners[r] for r in sorted(owners))
+    return tuple(owners[key] for key in sorted(owners))
 
 
 def _regions(name, training, inference):
@@ -69,6 +67,8 @@ def _regions(name, training, inference):
         candidates = tuple(s for s in sources if _covers(s, start, end))
         if not candidates:
             raise ValueError(f"Uncovered training region for {name}: {start} .. {end}")
+        if len({s.global_rank for s in candidates}) != len(candidates):
+            raise ValueError(f"Overlapping source regions on a rank for {name}")
         fp8 = str(inference.dtype).removeprefix("torch.") == "float8_e4m3fn"
         alignment = int(os.environ.get("SHARDFLY_FP8_BLOCK_ROWS", "128")) if fp8 else 1
         if fp8 and (len(shape) != 2 or any(

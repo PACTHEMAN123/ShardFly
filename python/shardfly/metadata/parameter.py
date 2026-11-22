@@ -16,17 +16,75 @@
 # Copyright the Awex developers, licensed under the Apache License, Version 2.0.
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import List, Tuple
 
 import torch
 
 from shardfly import logging
 from shardfly._utils.common import to_dict
-from shardfly.metadata.sharding import (
-    ShardingType,
-)
+from shardfly.capture import TensorKey
 
 logger = logging.getLogger(__name__)
+
+
+class ShardingType(Enum):
+    """
+    Enum representing the type of sharding applied to a parameter.
+    """
+
+    NO_SHARDING = "NO_SHARDING"
+    TP_SHARDING = "TP_SHARDING"
+    DP_TP_SHARDING = "DP_TP_SHARDING"
+    EP_SHARDING = "EP_SHARDING"
+    EP_TP_SHARDING = "EP_TP_SHARDING"
+
+
+@dataclass(slots=True)
+class RankInfo:
+    """
+    Holds information about the distributed training ranks and sizes for a model worker.
+
+    Attributes:
+        tp_rank (int): Tensor parallel rank.
+        tp_size (int): Tensor parallel size.
+        pp_rank (int): Pipeline parallel rank.
+        pp_size (int): Pipeline parallel size.
+        dp_size (int): Data parallel size.
+        attn_tp_rank (int): Attention tensor parallel rank.
+        attn_tp_size (int): Attention tensor parallel size.
+        attn_dp_rank (int): Attention data parallel rank.
+        world_size (int): Total world size.
+        global_rank (int): Global rank of the worker.
+        local_rank (int): Local rank of the worker.
+        engine_rank (int): Engine rank of the worker.
+        is_infer (bool): Whether the worker is an inference worker.
+        cp_rank (int): Context parallel rank.
+        cp_size (int): Context parallel world size.
+        cp_mode (str): Context parallel mode label (e.g. none/ring/ulysses).
+    """
+
+    tp_rank: int
+    tp_size: int
+    pp_rank: int
+    pp_size: int
+    dp_size: int
+    dp_rank: int
+    ep_rank: int
+    ep_size: int
+    ep_tp_rank: int
+    ep_tp_size: int
+    attn_tp_rank: int
+    attn_tp_size: int
+    attn_dp_rank: int
+    world_size: int
+    global_rank: int
+    local_rank: int
+    engine_rank: int
+    is_infer: bool
+    cp_rank: int = 0
+    cp_size: int = 1
+    cp_mode: str = "none"
 
 
 @dataclass(slots=True)
@@ -69,6 +127,12 @@ class ParameterShardMeta:
     cp_mode: str = "none"
     dp_rank: int = 0
     dp_size: int = 1
+    binding_key: TensorKey | None = None
+    span_numels: Tuple[int, ...] = ()
+
+    @property
+    def tensor_key(self) -> TensorKey:
+        return self.binding_key if self.binding_key is not None else self.name
 
 
 @dataclass(slots=True)
@@ -132,6 +196,8 @@ class ParameterMeta:
                     sharding_type=shard.sharding_type,
                     num_shards=shard.num_shards,
                     sharding_dim=shard.sharding_dim,
+                    binding_key=shard.binding_key,
+                    span_numels=shard.span_numels,
                 )
                 replica_shards.append(new_shard)
             shards.extend(replica_shards)
@@ -153,30 +219,11 @@ class ParameterMeta:
         ]
         new_meta.shards = shards
 
-        # Filter replicas to only include those that have shards for this global_rank
-        filtered_replicas = []
         for replica in new_meta.replicas:
-            replica_shards = [
+            replica.shards = [
                 shard for shard in replica.shards if shard.global_rank == global_rank
             ]
-            if len(replica_shards) == 1:
-                # This replica has exactly one shard for this rank, keep it
-                replica.shards = replica_shards
-                filtered_replicas.append(replica)
-            else:
-                assert len(replica_shards) == 0, (
-                    f"A tp worker should have at most one shard per replica but got {len(replica_shards)} shards for {global_rank}"
-                )
-
-        new_meta.replicas = filtered_replicas
-
-        # for mode expert parameters, it won't exist on all ranks
-        assert len(shards) <= 1, (
-            f"A tp worker should have one shard for model parameter but got {shards} for {global_rank}"
-        )
-        assert len(filtered_replicas) <= 1, (
-            f"No replicas found for global_rank {global_rank}"
-        )
+        new_meta.replicas = [replica for replica in new_meta.replicas if replica.shards]
 
         return new_meta
 

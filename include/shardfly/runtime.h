@@ -60,5 +60,6 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
                 const std::vector<int64_t>& forward_peers, const std::vector<int64_t>& ring_ids, bool sender,
                 int64_t sequence, const std::vector<std::vector<int64_t>>& quantization,
                 bool prepare_only, cudaStream_t stream);
+Metrics launch_prepared(int64_t handle, bool sender, int64_t sequence, bool profile_device, cudaStream_t stream);
 
 }  // namespace shardfly

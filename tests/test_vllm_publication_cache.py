@@ -1,7 +1,8 @@
 from types import SimpleNamespace
 
 import pytest
-from shardfly.integrations.vllm.server import ShardFlyVLLMServerAdapter
+
+from shardfly.integrations.vllm import ShardFlyVLLMServerAdapter
 
 
 def adapter_with_cache(events, reset_ok=True):
@@ -43,7 +44,7 @@ def test_validation_keeps_failures_from_nonzero_dp_ranks():
 
 
 def test_native_publication_collects_all_dp_results_and_invalidates_caches():
-    from shardfly.integrations.publication.vllm import PublicationVLLMServerAdapter
+    from shardfly.integrations.vllm import PublicationVLLMServerAdapter
 
     events = []
     adapter = PublicationVLLMServerAdapter(
@@ -59,7 +60,7 @@ def test_native_publication_collects_all_dp_results_and_invalidates_caches():
 
 
 def test_model_profile_returns_all_eight_dp_cores_without_transport_setup():
-    from shardfly.integrations.publication.vllm import PublicationVLLMServerAdapter
+    from shardfly.integrations.vllm import PublicationVLLMServerAdapter
 
     calls = []
 

@@ -83,6 +83,8 @@ struct DeviceState {
   std::vector<std::uint32_t> logical_to_communicator;
   impl::Schedule schedule;
   LaunchBuffers buffers;
+  Metrics plan_metrics;
+  std::uint32_t active_gin_peers = 0;
   ncclTeam_t world_team{};
   ncclTeam_t lsa_team{};
   int nccl_version = 0;
@@ -840,80 +842,11 @@ std::vector<impl::LoweringTask> build_tasks(
 
 }  // namespace
 
-Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std::vector<int64_t>& lengths,
-                const std::vector<int64_t>& tensor_offsets, const std::vector<int64_t>& tensor_row_bytes,
-                const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
-                const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts,
-                const std::vector<int64_t>& forward_peers, const std::vector<int64_t>& ring_ids, bool sender,
-                int64_t sequence, const std::vector<std::vector<int64_t>>& quantization,
-                bool prepare_only, cudaStream_t stream) {
-  using Clock = std::chrono::steady_clock;
-  const auto launch_start = Clock::now();
-  auto* state = reinterpret_cast<DeviceState*>(handle);
-  if (state == nullptr) {
-    throw std::runtime_error("Invalid transport state handle");
-  }
-  if (!prepare_only && (sequence <= 0 || static_cast<std::uint64_t>(sequence) <= state->last_sequence)) {
-    throw std::runtime_error("transport sequence must increase and be positive");
-  }
-
-  std::vector<std::uint32_t> active_peers;
-  const auto tasks = build_tasks(*state, tensors, lengths, tensor_offsets, tensor_row_bytes, tensor_row_strides, peers,
-                                 ordinals, expected_counts, forward_peers, ring_ids, &active_peers,
-                                 quantization, sender);
-  const impl::Direction direction = sender ? impl::Direction::kSend : impl::Direction::kRecv;
-  SHARDFLY_CUDA_CHECK(cudaSetDevice(state->device));
-
-  double host_lowering_time_ms = 0.0;
-  double metadata_upload_time_ms = 0.0;
-  double plan_initialization_time_ms = 0.0;
-  const bool plan_cache_hit = state->plan_initialized;
-  if (!state->plan_initialized) {
-    // All Python descriptors have been converted above. Collective allocation,
-    // lowering and uploads must allow an application's compute thread to run.
-    const auto initialization_start = Clock::now();
-    initialize_sparse_window(state, active_peers, tasks, direction, stream);
-    const auto config = lowering_config(state);
-    const auto lowering_start = Clock::now();
-    auto schedule = impl::lowerFixedTasks(tasks, active_peers, direction, config);
-    for (const auto& work : schedule.works) {
-      if (work.fifo_depth > state->layout.fifo_depth || work.step_bytes > state->layout.slot_bytes) {
-        throw std::runtime_error("transport schedule exceeds registered FIFO geometry");
-      }
-    }
-    host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
-
-    LaunchBuffers buffers;
-    try {
-      const auto metadata_start = Clock::now();
-      allocate_buffers(schedule, active_peers.size(), &buffers);
-      upload_buffers(schedule, active_peers, &buffers, stream);
-      metadata_upload_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - metadata_start).count();
-      state->tasks = tasks;
-      state->active_peers = active_peers;
-      state->schedule = std::move(schedule);
-      state->buffers = buffers;
-      state->direction = direction;
-      state->plan_initialized = true;
-    } catch (...) {
-      release_buffers(&buffers);
-      throw;
-    }
-    plan_initialization_time_ms =
-      std::chrono::duration<double, std::milli>(Clock::now() - initialization_start).count();
-  } else if (direction != state->direction || active_peers != state->active_peers || !same_tasks(tasks, state->tasks)) {
-    throw std::runtime_error("transport launch descriptors changed after the fixed plan was cached");
-  }
-
+static void cache_plan_metrics(DeviceState* state) {
   const auto& schedule = state->schedule;
   const auto& cached_peers = state->active_peers;
-
-  Metrics metrics;
-  if (prepare_only) {
-    std::map<std::string, double> phases;
-    for (const auto& phase : state->preparation_phases) phases[phase.first] = phase.second;
-    metrics["native_preparation_phases_ms"] = phases;
-  }
+  const auto direction = state->direction;
+  auto& metrics = state->plan_metrics;
   metrics["communicator_rank"] = std::int64_t(state->rank);
   metrics["lsa_team_size"] = std::int64_t(state->lsa_team.nRanks);
   metrics["work_count"] = std::int64_t(schedule.works.size());
@@ -936,9 +869,11 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
   metrics["max_work_fifo_depth"] = std::int64_t(max_work_fifo_depth);
   metrics["active_peer_count"] = std::int64_t(cached_peers.size());
   metrics["ring_broadcast"] = bool(
-    std::any_of(tasks.begin(), tasks.end(), [](const impl::LoweringTask& task) { return task.ring_id != impl::kNoRing; }));
+    std::any_of(state->tasks.begin(), state->tasks.end(),
+                [](const impl::LoweringTask& task) { return task.ring_id != impl::kNoRing; }));
   metrics["ring_relay_count"] = std::int64_t(std::count_if(
-    tasks.begin(), tasks.end(), [](const impl::LoweringTask& task) { return task.forward_peer != impl::kNoPeer; }));
+    state->tasks.begin(), state->tasks.end(),
+    [](const impl::LoweringTask& task) { return task.forward_peer != impl::kNoPeer; }));
   metrics["fifo_depth"] = std::int64_t(state->fifo_depth);
   metrics["registered_fifo_depth"] = std::int64_t(state->layout.fifo_depth);
   metrics["gin_fifo_depth"] = std::int64_t(state->gin_fifo_depth);
@@ -972,6 +907,7 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
   metrics["topology_path_bandwidth_gbps"] = double(active_path_bandwidth_gbps);
   metrics["lsa_peer_count"] = std::int64_t(active_lsa_peers);
   metrics["gin_peer_count"] = std::int64_t(active_gin_peers);
+  state->active_gin_peers = active_gin_peers;
   metrics["gin_enabled"] = bool(state->gin.enabled);
   metrics["gin_signal_count"] = std::int64_t(state->gin.signal_count);
   metrics["gin_connection_count"] = std::int64_t(state->gin.connection_count);
@@ -1017,19 +953,102 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
     metrics["fifo_layout_registered_mask"] = std::vector<int64_t>(
       state->registered_payload_channels.begin(), state->registered_payload_channels.end());
     std::vector<int64_t> input_bytes(state->world_size, 0), forward_bytes(state->world_size, 0);
-    for (const auto& task : tasks) {
+    for (const auto& task : state->tasks) {
       input_bytes[task.peer] += task.nbytes;
       if (task.forward_peer != impl::kNoPeer) forward_bytes[task.forward_peer] += task.nbytes;
     }
     metrics["fifo_layout_task_peer_bytes"] = std::move(input_bytes);
     metrics["fifo_layout_forward_peer_bytes"] = std::move(forward_bytes);
   }
+}
+
+static Metrics launch_impl(int64_t handle, const std::vector<TensorView>& tensors, const std::vector<int64_t>& lengths,
+                const std::vector<int64_t>& tensor_offsets, const std::vector<int64_t>& tensor_row_bytes,
+                const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
+                const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts,
+                const std::vector<int64_t>& forward_peers, const std::vector<int64_t>& ring_ids, bool sender,
+                int64_t sequence, const std::vector<std::vector<int64_t>>& quantization,
+                bool prepare_only, cudaStream_t stream, bool reuse_plan, bool profile_device) {
+  using Clock = std::chrono::steady_clock;
+  const auto launch_start = Clock::now();
+  auto* state = reinterpret_cast<DeviceState*>(handle);
+  if (state == nullptr) {
+    throw std::runtime_error("Invalid transport state handle");
+  }
+  if (!prepare_only && (sequence <= 0 || static_cast<std::uint64_t>(sequence) <= state->last_sequence)) {
+    throw std::runtime_error("transport sequence must increase and be positive");
+  }
+
+  std::vector<std::uint32_t> active_peers;
+  std::vector<impl::LoweringTask> tasks;
+  if (!reuse_plan) {
+    tasks = build_tasks(*state, tensors, lengths, tensor_offsets, tensor_row_bytes, tensor_row_strides, peers,
+                        ordinals, expected_counts, forward_peers, ring_ids, &active_peers,
+                        quantization, sender);
+  }
+  const impl::Direction direction = sender ? impl::Direction::kSend : impl::Direction::kRecv;
+  if (reuse_plan && (!state->plan_initialized || direction != state->direction)) {
+    throw std::runtime_error("transport has no prepared plan for this role");
+  }
+  SHARDFLY_CUDA_CHECK(cudaSetDevice(state->device));
+
+  double host_lowering_time_ms = 0.0;
+  double metadata_upload_time_ms = 0.0;
+  double plan_initialization_time_ms = 0.0;
+  const bool plan_cache_hit = state->plan_initialized;
+  if (!state->plan_initialized) {
+    // All Python descriptors have been converted above. Collective allocation,
+    // lowering and uploads must allow an application's compute thread to run.
+    const auto initialization_start = Clock::now();
+    initialize_sparse_window(state, active_peers, tasks, direction, stream);
+    const auto config = lowering_config(state);
+    const auto lowering_start = Clock::now();
+    auto schedule = impl::lowerFixedTasks(tasks, active_peers, direction, config);
+    for (const auto& work : schedule.works) {
+      if (work.fifo_depth > state->layout.fifo_depth || work.step_bytes > state->layout.slot_bytes) {
+        throw std::runtime_error("transport schedule exceeds registered FIFO geometry");
+      }
+    }
+    host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
+
+    LaunchBuffers buffers;
+    try {
+      const auto metadata_start = Clock::now();
+      allocate_buffers(schedule, active_peers.size(), &buffers);
+      upload_buffers(schedule, active_peers, &buffers, stream);
+      metadata_upload_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - metadata_start).count();
+      state->tasks = tasks;
+      state->active_peers = active_peers;
+      state->schedule = std::move(schedule);
+      state->buffers = buffers;
+      state->direction = direction;
+      state->plan_initialized = true;
+    } catch (...) {
+      release_buffers(&buffers);
+      throw;
+    }
+    plan_initialization_time_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - initialization_start).count();
+  } else if (!reuse_plan &&
+             (direction != state->direction || active_peers != state->active_peers || !same_tasks(tasks, state->tasks))) {
+    throw std::runtime_error("transport launch descriptors changed after the fixed plan was cached");
+  }
+
+  const auto& schedule = state->schedule;
+  const auto& cached_peers = state->active_peers;
+
+  if (state->plan_metrics.empty()) cache_plan_metrics(state);
+  Metrics metrics = state->plan_metrics;
   metrics["plan_cache_hit"] = bool(plan_cache_hit);
+  metrics["prepared_launch"] = reuse_plan;
   metrics["host_lowering_time_ms"] = host_lowering_time_ms;
   metrics["metadata_upload_time_ms"] = metadata_upload_time_ms;
   metrics["plan_initialization_time_ms"] = plan_initialization_time_ms;
 
   if (prepare_only) {
+    std::map<std::string, double> phases;
+    for (const auto& phase : state->preparation_phases) phases[phase.first] = phase.second;
+    metrics["native_preparation_phases_ms"] = std::move(phases);
     // Cache creation registers the FIFO window and uploads immutable schedule
     // metadata. Complete those operations before acknowledging membership
     // readiness. Never run a copy/quant/relay kernel or advance last_sequence.
@@ -1062,7 +1081,7 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
   args.local_window = reinterpret_cast<std::uint8_t*>(state->local_base);
   args.peer_windows = state->device_peer_windows;
   args.payload_peer_slots = state->device_payload_peer_slots;
-  impl::setGinKernelArgs(state->gin, state->window, active_gin_peers, state->gin_fifo_depth, &args);
+  impl::setGinKernelArgs(state->gin, state->window, state->active_gin_peers, state->gin_fifo_depth, &args);
   args.epoch = static_cast<unsigned long long>(sequence);
   args.timeout_cycles = state->timeout_cycles;
   const std::size_t profile_count =
@@ -1082,29 +1101,31 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
   SHARDFLY_CUDA_CHECK(cudaEventElapsedTime(&transfer_ms, state->buffers.transfer_start, state->buffers.transfer_end));
   metrics["transport_device_time_ms"] = double(transfer_ms);
 
-  std::vector<impl::KernelProfile> profiles(profile_count);
-  if (profile_count != 0) {
-    SHARDFLY_CUDA_CHECK(cudaMemcpy(profiles.data(), state->buffers.profiles,
-                                  profile_count * sizeof(impl::KernelProfile), cudaMemcpyDeviceToHost));
+  if (profile_device) {
+    std::vector<impl::KernelProfile> profiles(profile_count);
+    if (profile_count != 0) {
+      SHARDFLY_CUDA_CHECK(cudaMemcpy(profiles.data(), state->buffers.profiles,
+                                    profile_count * sizeof(impl::KernelProfile), cudaMemcpyDeviceToHost));
+    }
+    impl::KernelProfile profile_max{};
+    for (const auto& profile : profiles) {
+      profile_max.input_wait_cycles = std::max(profile_max.input_wait_cycles, profile.input_wait_cycles);
+      profile_max.output_wait_cycles = std::max(profile_max.output_wait_cycles, profile.output_wait_cycles);
+      profile_max.copy_cycles = std::max(profile_max.copy_cycles, profile.copy_cycles);
+      profile_max.post_cycles = std::max(profile_max.post_cycles, profile.post_cycles);
+      profile_max.final_wait_cycles = std::max(profile_max.final_wait_cycles, profile.final_wait_cycles);
+      profile_max.flush_cycles = std::max(profile_max.flush_cycles, profile.flush_cycles);
+      profile_max.slice_count = std::max(profile_max.slice_count, profile.slice_count);
+    }
+    const double cycles_per_millisecond = static_cast<double>(state->clock_rate_khz);
+    metrics["device_input_wait_time_ms"] = profile_max.input_wait_cycles / cycles_per_millisecond;
+    metrics["device_output_wait_time_ms"] = profile_max.output_wait_cycles / cycles_per_millisecond;
+    metrics["device_copy_time_ms"] = profile_max.copy_cycles / cycles_per_millisecond;
+    metrics["device_post_time_ms"] = profile_max.post_cycles / cycles_per_millisecond;
+    metrics["device_final_wait_time_ms"] = profile_max.final_wait_cycles / cycles_per_millisecond;
+    metrics["device_flush_time_ms"] = profile_max.flush_cycles / cycles_per_millisecond;
+    metrics["device_profile_max_slice_count"] = std::int64_t(profile_max.slice_count);
   }
-  impl::KernelProfile profile_max{};
-  for (const auto& profile : profiles) {
-    profile_max.input_wait_cycles = std::max(profile_max.input_wait_cycles, profile.input_wait_cycles);
-    profile_max.output_wait_cycles = std::max(profile_max.output_wait_cycles, profile.output_wait_cycles);
-    profile_max.copy_cycles = std::max(profile_max.copy_cycles, profile.copy_cycles);
-    profile_max.post_cycles = std::max(profile_max.post_cycles, profile.post_cycles);
-    profile_max.final_wait_cycles = std::max(profile_max.final_wait_cycles, profile.final_wait_cycles);
-    profile_max.flush_cycles = std::max(profile_max.flush_cycles, profile.flush_cycles);
-    profile_max.slice_count = std::max(profile_max.slice_count, profile.slice_count);
-  }
-  const double cycles_per_millisecond = static_cast<double>(state->clock_rate_khz);
-  metrics["device_input_wait_time_ms"] = profile_max.input_wait_cycles / cycles_per_millisecond;
-  metrics["device_output_wait_time_ms"] = profile_max.output_wait_cycles / cycles_per_millisecond;
-  metrics["device_copy_time_ms"] = profile_max.copy_cycles / cycles_per_millisecond;
-  metrics["device_post_time_ms"] = profile_max.post_cycles / cycles_per_millisecond;
-  metrics["device_final_wait_time_ms"] = profile_max.final_wait_cycles / cycles_per_millisecond;
-  metrics["device_flush_time_ms"] = profile_max.flush_cycles / cycles_per_millisecond;
-  metrics["device_profile_max_slice_count"] = std::int64_t(profile_max.slice_count);
 
   impl::WindowHeader header{};
   SHARDFLY_CUDA_CHECK(cudaMemcpy(&header, state->local_base, sizeof(header), cudaMemcpyDeviceToHost));
@@ -1118,6 +1139,22 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
   return metrics;
 }
 
+Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std::vector<int64_t>& lengths,
+               const std::vector<int64_t>& tensor_offsets, const std::vector<int64_t>& tensor_row_bytes,
+               const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
+               const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts,
+               const std::vector<int64_t>& forward_peers, const std::vector<int64_t>& ring_ids, bool sender,
+               int64_t sequence, const std::vector<std::vector<int64_t>>& quantization,
+               bool prepare_only, cudaStream_t stream) {
+  return launch_impl(handle, tensors, lengths, tensor_offsets, tensor_row_bytes, tensor_row_strides,
+                     peers, ordinals, expected_counts, forward_peers, ring_ids, sender, sequence,
+                     quantization, prepare_only, stream, false, true);
+}
+
+Metrics launch_prepared(int64_t handle, bool sender, int64_t sequence, bool profile_device, cudaStream_t stream) {
+  return launch_impl(handle, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, sender, sequence,
+                     {}, false, stream, true, profile_device);
+}
 
 std::string get_unique_id() {
   ncclUniqueId id;

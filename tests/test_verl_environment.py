@@ -1,4 +1,4 @@
-from shardfly.integrations.verl.environment import configure_ray_locality
+from shardfly.topology import configure_ray_locality
 
 
 def test_single_gpu_ray_actor_uses_physical_gpu_as_local_rank_offset():

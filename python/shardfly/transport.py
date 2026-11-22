@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import Enum
-from functools import wraps
+from functools import cached_property, wraps
 from types import SimpleNamespace
 from typing import Any
 
@@ -108,6 +108,14 @@ class _Batch:
     ring_ids: list[int]
     quantization: list[list[int]] = dataclass_field(default_factory=list)
     scale_tensors: list[torch.Tensor] = dataclass_field(default_factory=list)
+
+    @cached_property
+    def payload_metrics(self):
+        return {
+            "payload_bytes": float(sum(self.lengths)),
+            "fp8_quantized_span_count": sum(bool(q[0]) for q in self.quantization),
+            "fp8_wire_bytes": sum(length for length, q in zip(self.lengths, self.quantization) if q[0]),
+        }
 
 
 _NO_PEER = -1
@@ -768,7 +776,7 @@ def _build_send_batch(
                 raise TransportUnavailableError(
                     "BF16-to-FP8 transfer requires the blockwise feature on every rank"
                 )
-            parameter = parameters[op.send_shard_meta.name]
+            parameter = parameters[getattr(op.send_shard_meta, "tensor_key", op.send_shard_meta.name)]
             if isinstance(parameter, StaticTensorLayout):
                 if (
                     op.send_tensor_span_numels
@@ -929,7 +937,7 @@ def _build_recv_batch(
                     )
                 order = route_orders[route_key]
             first_fragment = len(tensors)
-            parameter = parameters[op.recv_shard_meta.name]
+            parameter = parameters[getattr(op.recv_shard_meta, "tensor_key", op.recv_shard_meta.name)]
             if parameter.dtype == torch.float8_e4m3fn and not fp8_block_shape:
                 raise TransportUnavailableError(
                     "Native FP8 parameters require the blockwise transfer feature"
@@ -1162,6 +1170,7 @@ class Transport:
         )
         self._membership_binding = None
         self._device_prepared_binding = None
+        self._native_plan_batch = None
         self._reconfiguration_failed = False
         if world_size < 2 or world_size > 256:
             raise TransportUnavailableError(
@@ -1479,8 +1488,12 @@ class Transport:
             self._logged_batch_shape = True
         init_time_ms = self._ensure_initialized()
         assert self._extension is not None and self._handle is not None
-        extension_metrics = dict(
-            self._extension.launch(
+        launch_prepared = getattr(self._extension, "launch_prepared", None)
+        if self._native_plan_batch is batch and launch_prepared is not None:
+            profile = os.environ.get("SHARDFLY_PROFILE", "0").lower() in {"1", "true", "yes"}
+            extension_metrics = dict(launch_prepared(self._handle, bool(sender), int(sequence), profile))
+        else:
+            extension_metrics = dict(self._extension.launch(
                 self._handle,
                 batch.tensors,
                 batch.lengths,
@@ -1495,18 +1508,13 @@ class Transport:
                 bool(sender),
                 int(sequence),
                 *([batch.quantization] if self.fp8_block_shape else []),
-            )
-        )
+            ))
+            self._native_plan_batch = batch
         extension_metrics["hca_policy"] = os.environ.get(
             "SHARDFLY_HCA_POLICY", "balanced"
         )
         extension_metrics["fp8_blockwise"] = self.fp8_block_shape is not None
-        extension_metrics["fp8_quantized_span_count"] = sum(
-            bool(q[0]) for q in batch.quantization
-        )
-        extension_metrics["fp8_wire_bytes"] = sum(
-            length for length, q in zip(batch.lengths, batch.quantization) if q[0]
-        )
+        extension_metrics.update(batch.payload_metrics)
         extension_metrics["selected_hca"] = os.environ.get("NCCL_IB_HCA", "topology")
         extension_metrics["ring_order_strategy"] = (
             _RingOrderStrategy.ROOT_SWIZZLE.value
@@ -1533,7 +1541,6 @@ class Transport:
         copyback_time_ms = (time.perf_counter() - copyback_start) * 1000.0
         extension_metrics.update(
             {
-                "payload_bytes": float(sum(batch.lengths)),
                 "transport_init_time_ms": init_time_ms,
                 "python_copyback_time_ms": copyback_time_ms,
                 "transport_total_time_ms": (time.perf_counter() - run_start) * 1000.0,
@@ -1724,6 +1731,7 @@ class Transport:
                     "Device prepare did not establish a cache without launching a kernel"
                 )
             self._device_prepared_binding = (parameters, plan, bool(sender))
+            self._native_plan_batch = batch
             metrics.update(
                 transport_init_time_ms=init_time_ms,
                 transport_initialization_phases_ms=dict(
@@ -1864,6 +1872,7 @@ class Transport:
             self._prepared_send = None
             self._prepared_recv = None
             self._device_prepared_binding = None
+            self._native_plan_batch = None
 
     def __del__(self):
         try:

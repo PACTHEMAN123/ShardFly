@@ -10,7 +10,8 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 find_package(CUDAToolkit REQUIRED)
 find_path(NCCL_INCLUDE_DIR nccl.h HINTS "${SHARDFLY_NCCL_ROOT}/include" REQUIRED)
-find_library(NCCL_LIBRARY nccl HINTS "${SHARDFLY_NCCL_ROOT}/lib" "${SHARDFLY_NCCL_ROOT}/lib64" REQUIRED)
+find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2
+  HINTS "${SHARDFLY_NCCL_ROOT}/lib" "${SHARDFLY_NCCL_ROOT}/lib64" REQUIRED)
 if(NOT EXISTS "${NCCL_INCLUDE_DIR}/nccl_device.h")
   message(FATAL_ERROR "ShardFly requires NCCL Device API headers (NCCL 2.30.4+ for GIN)")
 endif()
@@ -21,7 +22,7 @@ set_target_properties(shardfly PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(shardfly PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-  "${NCCL_INCLUDE_DIR}")
+  $<BUILD_INTERFACE:${NCCL_INCLUDE_DIR}>)
 target_include_directories(shardfly PRIVATE include/shardfly)
 target_link_libraries(shardfly PUBLIC CUDA::cudart "${NCCL_LIBRARY}" ${CMAKE_DL_LIBS})
 target_compile_definitions(shardfly PUBLIC NCCL_OS_LINUX)

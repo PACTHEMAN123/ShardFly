@@ -23,19 +23,23 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from shardfly.integrations.config import InferenceConfig
-from shardfly.integrations.sharding.vllm import get_vllm_expert_coordinates
-from shardfly.integrations.verl.environment import configure_ray_locality
+from shardfly.topology import configure_rank_affinity, configure_ray_locality
 
 configure_ray_locality()
-from shardfly.integrations.publication.vllm import PublicationVLLMServerAdapter
-from shardfly.integrations.vllm.server import ShardFlyVLLMServerAdapter
+from shardfly.integrations.vllm import (
+    InferenceConfig,
+    PublicationVLLMServerAdapter,
+    ShardFlyVLLMServerAdapter,
+)
 
 logger = logging.getLogger(__name__)
 try:
-    from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
+    from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel
 except ImportError:
-    from vllm.entrypoints.openai.protocol import OpenAIBaseModel
+    try:
+        from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
+    except ImportError:
+        from vllm.entrypoints.openai.protocol import OpenAIBaseModel
 try:
     from vllm.entrypoints.openai.api_server import router
 
@@ -47,38 +51,33 @@ _shardfly_build_app_patched = False
 _shardfly_plugin_registered = False
 _SHARDFLY_WORKER_METHODS = {
     "_get_model_param_info": (
-        "shardfly.integrations.metadata.inference",
+        "shardfly.integrations.reader",
         "InferParamMetaResolver._get_model_param_info",
     ),
     "_init_in_tp_worker": (
-        "shardfly.integrations.reader.base",
+        "shardfly.integrations.reader",
         "WeightsReader._init_in_tp_worker",
     ),
     "_update_parameters_in_tp_worker": (
-        "shardfly.integrations.reader.base",
+        "shardfly.integrations.reader",
         "WeightsReader._update_parameters_in_tp_worker",
     ),
-    "_pre_update_weights_in_tp_worker": (
-        "shardfly.integrations.reader.base",
-        "WeightsReader._pre_update_weights_in_tp_worker",
-    ),
     "_pre_validate_weights_on_tp_worker": (
-        "shardfly.integrations.reader.base",
+        "shardfly.integrations.reader",
         "WeightsReader._pre_validate_weights_on_tp_worker",
     ),
     "_verify_weights_on_tp_worker": (
-        "shardfly.integrations.reader.base",
+        "shardfly.integrations.reader",
         "WeightsReader._verify_weights_on_tp_worker",
     ),
 }
 _SHARDFLY_WORKER_SIGNATURES = {
     "_get_model_param_info": {
-        "required": ["engine_name", "infer_engine_config"],
-        "optional": ["convert_params", "engine_rank"],
+        "required": [],
+        "optional": ["engine_rank"],
     },
     "_init_in_tp_worker": {
         "required": [
-            "infer_conf_bytes",
             "parameters_meta_bytes",
             "training_params_meta_bytes",
             "engine_rank",
@@ -95,7 +94,6 @@ _SHARDFLY_WORKER_SIGNATURES = {
         ],
     },
     "_update_parameters_in_tp_worker": {"required": ["step_id"], "optional": []},
-    "_pre_update_weights_in_tp_worker": {"required": ["step_id"], "optional": []},
     "_pre_validate_weights_on_tp_worker": {"required": ["step_id"], "optional": []},
     "_verify_weights_on_tp_worker": {
         "required": ["step_id"],
@@ -200,6 +198,17 @@ def _get_publication_adapter(raw_request):
     return adapter
 
 
+def get_vllm_expert_coordinates(enable_expert_parallel, get_ep_group):
+    # vLLM allocates the group even when experts use TP instead of EP.
+    if not enable_expert_parallel:
+        return 0, 1
+    try:
+        group = get_ep_group()
+        return group.rank_in_group, group.world_size
+    except AssertionError:
+        return 0, 1
+
+
 def _patch_shardfly_worker() -> None:
     try:
         from vllm.distributed.parallel_state import (
@@ -224,8 +233,6 @@ def _patch_shardfly_worker() -> None:
         def init_with_affinity(
             vllm_config, rank, distributed_init_method, local_rank, *args, **kwargs
         ):
-            from shardfly.integrations.affinity import configure_rank_affinity
-
             physical_ids = getattr(
                 vllm_config.parallel_config, "assigned_physical_gpu_ids", None
             )
@@ -362,9 +369,6 @@ def _patch_shardfly_worker() -> None:
                 pp_size=parallel_config.pipeline_parallel_size,
                 dp_size=parallel_config.data_parallel_size,
                 ep_size=inferred_ep_size,
-                enable_dp_attention=False,
-                enable_dp_lm_head=False,
-                moe_dense_tp_size=None,
                 nnodes=nnodes,
                 node_rank=node_rank,
                 num_engines=external_num_engines,
@@ -403,7 +407,9 @@ def _patch_shardfly_worker() -> None:
         if isinstance(infer_engine_config, dict):
             infer_engine_config = InferenceConfig.from_dict(infer_engine_config)
             task_kwargs["infer_engine_config"] = infer_engine_config
-        task_kwargs["model"] = _shardfly_transfer_model(self.model_runner)
+        from shardfly.integrations.loader_capture import transfer_model
+
+        task_kwargs["model"] = transfer_model(self.model_runner)
         task_kwargs["model_context"] = _shardfly_model_context(
             self, infer_engine_config
         )
@@ -411,7 +417,7 @@ def _patch_shardfly_worker() -> None:
         return _sanitize_for_ipc(result)
 
     def publication_init(self, mechanism: str, config: dict):
-        from shardfly.integrations.publication.registry import (
+        from shardfly.integrations.publication import (
             create_vllm_publication_receiver,
         )
 
@@ -433,7 +439,7 @@ def _patch_shardfly_worker() -> None:
             raise RuntimeError("Publication receiver is not initialized")
         from shardfly.profiling.timeline import publication
         with publication("rollout", int(step_id), int(receiver.worker_rank)):
-            result = receiver.update(_shardfly_transfer_model(self.model_runner), step_id)
+            result = receiver.update(self.model_runner.model, step_id)
         return _sanitize_for_ipc(result)
 
     def publication_configure(self, config: dict):
@@ -495,21 +501,6 @@ def _filter_shardfly_kwargs(method_name: str, kwargs: dict) -> dict:
     return filtered
 
 
-def _shardfly_transfer_model(model_runner):
-    model = model_runner.model
-    config = model_runner.vllm_config.model_config.hf_config
-    if "Glm4MoeLiteForCausalLM" not in (getattr(config, "architectures", None) or []):
-        return model
-    if model_runner.vllm_config.speculative_config is None:
-        return model
-    draft = getattr(getattr(model_runner, "drafter", None), "model", None)
-    if draft is None:
-        raise RuntimeError("GLM MTP is enabled but its draft model is unavailable")
-    from shardfly.integrations.models.glm4_moe_lite import GLM47FlashTransferModel
-
-    return GLM47FlashTransferModel(model, draft, config.num_hidden_layers)
-
-
 def flush_cache(self):
     flush_fn = getattr(self.model_runner, "flush_cache", None)
     if callable(flush_fn):
@@ -529,10 +520,9 @@ def _ensure_router_attached() -> None:
     if _USING_LEGACY_VLLM_ROUTER or _shardfly_build_app_patched:
         return
     try:
+        from vllm.entrypoints.launchers.api_server import entry as _api_server_module
+    except ImportError:
         from vllm.entrypoints.openai import api_server as _api_server_module
-    except ImportError as exc:
-        logger.warning("Cannot patch vLLM build_app for ShardFly routes: %s", exc)
-        return
     original_build_app = getattr(_api_server_module, "build_app", None)
     if original_build_app is None:
         logger.warning(
@@ -567,7 +557,6 @@ def register_shardfly_plugin() -> None:
     @router.post("/communication_memory")
     async def communication_memory(raw_request: Request):
         from shardfly.profiling.communication_memory import memory_task
-        from shardfly.integrations.publication.vllm import PublicationVLLMServerAdapter
 
         adapter = PublicationVLLMServerAdapter(
             raw_request.app.state.engine_client, asyncio.get_running_loop(), 120)
@@ -765,8 +754,3 @@ def register_shardfly_plugin() -> None:
         except Exception as exc:
             logger.exception("Publication close failed")
             return _to_json_error(f"Publication close failed: {exc}")
-
-
-def register_shardfly_routes() -> None:
-    """Public entrypoint to register ShardFly routes without relying on vLLM plugin system."""
-    register_shardfly_plugin()
