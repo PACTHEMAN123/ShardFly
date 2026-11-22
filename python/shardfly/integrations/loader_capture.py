@@ -3,7 +3,6 @@
 import os
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
-from copy import copy as copy_config
 from dataclasses import dataclass, field, replace
 from functools import cache, partial
 from math import prod
@@ -327,7 +326,7 @@ def transfer_model(model_runner):
         draft = getattr(getattr(model_runner, "drafter", None), "model", None)
     draft_plan = getattr(draft, CAPTURE_ATTRIBUTE, None)
     if draft_plan is None:
-        raise ValueError("The MTP draft must also use shardfly_capture")
+        raise ValueError("The MTP draft must also use the ShardFly capture loader")
     current = _DraftTransferModel(model, draft)
     setattr(current, CAPTURE_ATTRIBUTE, _DraftLoadPlan(plan, draft_plan.without_shared_parameters(draft, model)))
     model_runner._shardfly_transfer_model = current
@@ -339,7 +338,7 @@ class LoaderCapture:
         self._model = model
         self._plan = getattr(model, CAPTURE_ATTRIBUTE, None)
         if self._plan is None:
-            raise ValueError("Start vLLM with --load-format shardfly_capture")
+            raise ValueError("The model was not loaded by the ShardFly capture loader")
 
     def snapshot(self, names=None) -> CapturedWeights:
         return self._plan.snapshot(self._model, names)
@@ -579,11 +578,9 @@ def register_capture_loader():
     if register is None:
         return
 
-    @register("shardfly_capture")
+    @register("auto")
     class CaptureModelLoader(model_loader.DefaultModelLoader):
         def __init__(self, load_config):
-            load_config = copy_config(load_config)
-            load_config.load_format = "auto"
             super().__init__(load_config)
             self._capture = None
 
@@ -599,13 +596,13 @@ def register_capture_loader():
                     or os.environ.get("SHARDFLY_FP8_BLOCKWISE") != "1"
                     or list((quantization or {}).get("weight_block_size") or ()) != block
                 ):
-                    raise ValueError(f"shardfly_capture requires native FP8 with block size {block}")
+                    raise ValueError(f"ShardFly capture requires native FP8 with block size {block}")
             speculative = vllm_config.speculative_config
             if speculative is not None:
                 target = getattr(speculative, "target_model_config", model_config)
                 architectures = getattr(target.hf_config, "architectures", None) or ()
                 if "Glm4MoeLiteForCausalLM" not in architectures or not str(speculative.method).endswith("mtp"):
-                    raise ValueError("shardfly_capture only supports GLM-4.7-Flash MTP")
+                    raise ValueError("ShardFly capture supports GLM-4.7-Flash MTP")
             hf_config = getattr(model_config, "hf_config", None)
             architectures = getattr(hf_config, "architectures", None) or ()
             with WeightLoadCapture(stacked_experts="GptOssForCausalLM" in architectures) as capture:

@@ -276,13 +276,14 @@ def test_vllm_loader_captures_inside_default_startup(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm", vllm)
     monkeypatch.setitem(sys.modules, "vllm.model_executor", model_executor)
     register_capture_loader()
-    config = SimpleNamespace(load_format="shardfly_capture")
-    loader = registered["shardfly_capture"](config)
+    config = SimpleNamespace(load_format="auto")
+    assert registered.keys() == {"auto"}
+    loader = registered["auto"](config)
     model_config = SimpleNamespace(quantization=None)
     vllm_config = SimpleNamespace(speculative_config=None, mutate_after_load=False)
     with torch.inference_mode():
         model = loader.load_model(vllm_config, model_config)
-        assert config.load_format == "shardfly_capture"
+        assert config.load_format == "auto"
         assert set(getattr(model, CAPTURE_ATTRIBUTE).snapshot(model).tensors) == set(_weights())
         vllm_config.mutate_after_load = True
         with pytest.raises(ValueError, match="modified output after loading"):

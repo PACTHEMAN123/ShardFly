@@ -105,88 +105,31 @@ server started with the package on `PYTHONPATH` exposes the publication API:
 - `POST /publication_init`, `/publication_update`, `/publication_close`
 - `GET /publication_telemetry`
 
-The optional standalone server entrypoint is
-`python -m shardfly.integrations.vllm`. For explicit worker-extension
-configuration, use `shardfly.integrations.vllm.ShardFlyWorkerExtension`. The veRL
-checkpoint-engine registration module is `shardfly.integrations.verl`.
+Model converters live in `python/shardfly/integrations/models/`. Workers are
+patched by `python/shardfly/integrations/vllm/plugin.py`, including spawned DP
+workers through `worker_extension.py`.
 
-### Capture training and inference layouts
+### Loader capture
 
-Start each serving worker with the ShardFly plugin and a vLLM version that
-supports `register_model_loader` and `DefaultModelLoader.get_all_weights`
-(for example v0.21.0).
+With the ShardFly plugin enabled, vLLM's default loader captures the native
+weight layout while loading the checkpoint. Megatron Bridge supplies the
+training-side shard layout. Repeated updates use the prepared transfer schedule.
 
-```sh
-vllm serve /path/to/checkpoint --load-format shardfly_capture
-```
+| Parallelism | Megatron training | vLLM rollout |
+| --- | --- | --- |
+| Tensor parallelism (TP) | ✅ | ✅ |
+| Expert parallelism (EP) | ✅ | ✅ |
+| Pipeline parallelism (PP) | ✅ | ✅ |
+| Context parallelism (CP) | ✅ | ✅ |
+| Data parallelism (DP) | ✅ | ✅ |
+| Fully sharded data parallelism (FSDP) | ✅ | ❌ |
 
-On each training rank, use the wrapped model after initializing the torch
-distributed process group.
+## veRL adapter
 
-```python
-from shardfly.capture import capture_training
-from shardfly.integrations.engine import CapturedTrainingEngine
-
-engine = CapturedTrainingEngine(capture_training(model), meta_server_addr=address)
-# After each optimizer step, concurrently with POST /shardfly_update.
-engine.set_global_step(step_id)
-engine.write_weights()
-```
-
-Start one metadata server with `shardfly.control.store.start_meta_server()` and
-share its `host:port` with all training ranks. Call `POST /shardfly_init` with
-that `meta_server_addr` before the first update. The loader and training engine
-produce the same shard records and tensor bindings. Both sides must use the
-checkpoint's parameter names and element order.
-
-Training capture uses the PyTorch Distributed Checkpoint local save plan.
-FSDP1, FSDP2, and DCP-compatible meshes use the same entry point. For a custom
-export, pass `capture_training(model, state_dict=export)`, where `export(model)`
-returns a DCP-compatible sharded state dict with checkpoint names. The writer
-selects entries that the inference loader recorded, and every recorded target
-must have a complete training source. It stages materialized or CPU shards and
-converts FP32, BF16, and FP16 weights to the receiver's dtype when needed.
-Use `stage=True` when a wrapper may replace live parameter storage between
-updates. With stable CUDA storage and matching dtypes, directly addressable
-source views can be sent in place. For Megatron Bridge models,
-`capture_megatron(models, bridge)` resolves checkpoint coordinates and binds
-rank-local native parameter views during planning. Stable Megatron parameters
-reuse prepared device descriptors on later publications. The native launch
-uses the prepared schedule and the new sequence number. Megatron-FSDP lends
-its gathered parameters for the duration of each send.
-
-The vLLM loader captures rectangular copies, fused projections, and padded
-vocabularies. It handles BF16 GPT-OSS expert layouts and GLM-4.7-Flash MTP
-weights and refreshes MLA attention weights derived during startup. Captured
-regions must tile each tensor without overlap and with uniform replication.
-CUDA sends require contiguous or single-row-stride transfer views.
-
-Native E4M3 checkpoints can receive fused BF16-to-FP8 updates. Set
-`SHARDFLY_FP8_BLOCKWISE=1` on each side and use matching block dimensions
-(`SHARDFLY_FP8_BLOCK_ROWS` and `SHARDFLY_FP8_BLOCK_COLS`, default 128).
-Set rollout's `SHARDFLY_CHECKPOINT_PATH` to the BF16 source for verification.
-
-After starting the rollout server, check two publications from a Megatron host.
-
-```sh
-torchrun --standalone --nproc-per-node=2 scripts/loader_exchange.py \
-  --megatron --tp 2 --model /path/to/bf16-checkpoint \
-  --metadata-host TRAINER_IP --rollout http://ROLLOUT_IP:8000
-```
-
-The script clears rollout weights and checks them after each publication.
-Repeat `--rollout` for independent replicas. Use `--mfsdp optim`,
-`--mfsdp optim_grads`, or `--mfsdp optim_grads_params` for Megatron-FSDP.
-Use `--fsdp2` for PyTorch DCP capture.
-
-### veRL
-
-The `shardfly` checkpoint backend uses the same capture for the actor's
-`module`. FSDP actors use DCP by default. An actor can supply
-`shardfly_state_dict(module)` to expose its existing canonical export.
-Use `--load-format shardfly_capture` for the rollout workers. The separate native
-checkpoint benchmark delegates loading and optional FP8 quantization to
-veRL and vLLM.
+`python/shardfly/integrations/verl/` provides a checkpoint-engine adapter and
+locality-aware Ray placement. The native NCCL publication path in
+`integrations/publication/verl_native.py` uses the same transport and supports
+FP8 checkpoints.
 
 ## Tests
 
